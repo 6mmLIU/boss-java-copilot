@@ -1,0 +1,28 @@
+{
+  "name": "boss-java-copilot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cross-platform local BOSS Java job application copilot with review UI, filters, Playwright automation, and audit logs.",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "start": "node server/index.js",
+    "check": "node --check server/index.js && node --check server/automation/bossRunner.js && node --check server/lib/rules.js && vite build"
+  },
+  "dependencies": {
+    "@heroui/react": "^3.1.0",
+    "@heroui/styles": "^3.1.0",
+    "@tailwindcss/vite": "^4.3.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "express": "^5.1.0",
+    "lucide-react": "^0.468.0",
+    "playwright": "^1.54.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "tailwindcss": "^4.3.0",
+    "vite": "^7.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {}
+}
