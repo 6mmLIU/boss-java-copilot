@@ -16,7 +16,6 @@ import {
 } from "@heroui/react";
 import {
   AlertTriangle,
-  BadgeCheck,
   Bot,
   BriefcaseBusiness,
   Building2,
@@ -27,6 +26,7 @@ import {
   Filter,
   Gauge,
   ListFilter,
+  LogIn,
   Monitor,
   Play,
   RefreshCw,
@@ -51,6 +51,7 @@ const tabItems = [
 const statusLabels = {
   idle: "空闲",
   preflight: "预检中",
+  waitingLogin: "等待登录",
   running: "运行中",
   stopping: "停止中",
   blocked: "需人工处理",
@@ -82,7 +83,7 @@ function shortNumber(value) {
 }
 
 function statusTone(state) {
-  if (state === "running" || state === "preflight") return "info";
+  if (state === "running" || state === "preflight" || state === "waitingLogin") return "info";
   if (state === "blocked" || state === "error") return "danger";
   if (state === "done") return "success";
   return "neutral";
@@ -235,8 +236,8 @@ function App() {
     }
   }
 
-  async function preflight() {
-    await runAction("preflight", async () => request("/api/run/preflight", { method: "POST", body: JSON.stringify({ config }) }));
+  async function openLogin() {
+    await runAction("login", async () => request("/api/browser/login", { method: "POST", body: JSON.stringify({ config }) }));
   }
 
   async function startRun(mode) {
@@ -334,7 +335,7 @@ function App() {
       {(notice || error || status.blocker) && (
         <section className={cx("notice-row", error || status.blocker ? "danger" : "success")}>
           {error || status.blocker ? <AlertTriangle size={16} /> : <CheckCircle2 size={16} />}
-          <span>{error || status.blocker || notice}</span>
+          <span>{error || (status.blocker ? status.message || status.blocker : notice)}</span>
         </section>
       )}
 
@@ -369,7 +370,7 @@ function App() {
             onConfig={updateConfig}
             onCity={updateCity}
             onSave={saveConfig}
-            onPreflight={preflight}
+            onLogin={openLogin}
             onStartReview={() => startRun("review")}
             onOpenAuto={autoConfirm.open}
             onStop={stopRun}
@@ -515,7 +516,7 @@ function RunPanel({
   onConfig,
   onCity,
   onSave,
-  onPreflight,
+  onLogin,
   onStartReview,
   onOpenAuto,
   onStop,
@@ -526,7 +527,7 @@ function RunPanel({
         <Card.Header>
           <div>
             <Card.Title>运行控制</Card.Title>
-            <Card.Description>先预检登录态，再选择复审模式或自动投递模式。</Card.Description>
+            <Card.Description>先打开登录页，登录完成后再启动复审或自动投递。</Card.Description>
           </div>
           <StatusPill state={status.state} />
         </Card.Header>
@@ -617,9 +618,9 @@ function RunPanel({
               {busy === "save" ? <Spinner size="sm" /> : <Save size={16} />}
               保存配置
             </Button>
-            <Button variant="secondary" onPress={onPreflight} isDisabled={isRunning || Boolean(busy)}>
-              {busy === "preflight" ? <Spinner size="sm" /> : <BadgeCheck size={16} />}
-              预检登录
+            <Button variant="secondary" onPress={onLogin} isDisabled={isRunning || Boolean(busy)}>
+              {busy === "login" ? <Spinner size="sm" /> : <LogIn size={16} />}
+              打开登录
             </Button>
             <Button variant="primary" onPress={onStartReview} isDisabled={isRunning || Boolean(busy)}>
               {busy === "start-review" ? <Spinner size="sm" /> : <Eye size={16} />}

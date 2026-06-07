@@ -153,6 +153,14 @@ app.post("/api/run/preflight", (req, res) =>
   }),
 );
 
+app.post("/api/browser/login", (req, res) =>
+  sendJson(res, async () => {
+    const config = mergeConfig(req.body?.config || (await readConfig()));
+    const result = await runner.openLogin(config);
+    return { ok: true, result, status: runner.getStatus() };
+  }),
+);
+
 app.post("/api/run/start", (req, res) =>
   sendJson(res, async () => {
     const base = await readConfig();

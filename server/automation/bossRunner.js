@@ -120,6 +120,42 @@ export class BossRunner extends EventEmitter {
     return result;
   }
 
+  async openLogin(config = defaultConfig) {
+    this.abortRequested = false;
+    this.updateStatus({
+      state: "waitingLogin",
+      message: "请在打开的 BOSS 登录页完成登录",
+      blocker: "",
+      currentCity: "",
+      currentQuery: "",
+    });
+    try {
+      const page = await this.ensureContext(config, { initialUrl: LOGIN_URL, forceNavigate: true });
+      const opened = await this.openLoginPage(page);
+      if (!opened) {
+        await openLoginInExternalChrome(path.resolve(this.rootDir, config.profileDir || "data/browser-profile"), config).catch((error) => {
+          this.emitLog(`External login page fallback failed: ${error.message}`, "warn");
+        });
+      }
+      this.updateStatus({
+        state: "waitingLogin",
+        message: opened
+          ? "请在打开的 BOSS 登录页完成登录；完成后再点击开始复审或自动投递"
+          : "已尝试打开 BOSS 登录页；如果仍是空白，请关闭旧自动化窗口后再点打开登录",
+        blocker: "",
+        currentCity: "",
+        currentQuery: "",
+      });
+      this.emitLog("Login page opened; waiting for manual login");
+      return { ok: true, url: opened ? page.url() : LOGIN_URL };
+    } catch (error) {
+      if (isProfileInUseError(error)) {
+        return this.blockOnProfileInUse(error);
+      }
+      throw error;
+    }
+  }
+
   async start(configInput = {}) {
     if (this.status.state === "running") {
       return this.getStatus();
@@ -324,7 +360,8 @@ export class BossRunner extends EventEmitter {
   async requireLoggedIn(config) {
     let page;
     try {
-      page = await this.ensureContext(config, { initialUrl: LOGIN_URL, forceNavigate: true });
+      const hasLivePage = this.context && this.page && !this.page.isClosed();
+      page = hasLivePage ? await this.ensureContext(config) : await this.ensureContext(config, { initialUrl: LOGIN_URL, forceNavigate: true });
     } catch (error) {
       if (isProfileInUseError(error)) {
         return this.blockOnProfileInUse(error);
@@ -371,7 +408,7 @@ export class BossRunner extends EventEmitter {
     this.updateStatus({
       state: "blocked",
       blocker: PROFILE_IN_USE,
-      message: "已尝试把 BOSS 登录页打开到旧自动化窗口；登录后请关闭旧窗口，再点预检登录",
+      message: "已尝试把 BOSS 登录页打开到旧自动化窗口；如果仍是空白，请关闭旧窗口后再点打开登录",
       currentCity: "",
       currentQuery: "",
     });
@@ -392,7 +429,8 @@ export class BossRunner extends EventEmitter {
     const blocker = detectSecurityBlocker(bodyHead);
     const loginText = /登录|注册|扫码|验证码|微信登录|手机号登录|密码登录|登录 \/ 注册|BOSS直聘 APP/.test(bodyHead);
     const loginControlsVisible = signals.loginControlCount > 0;
-    const looksLoggedOut = Boolean(blocker) || page.url().includes("/web/user") || loginControlsVisible || (loginText && signals.cardCount === 0);
+    const blankPage = /^(about:blank|chrome:\/\/newtab)/i.test(page.url()) || (!bodyHead && signals.cardCount === 0 && signals.chatButtonCount === 0);
+    const looksLoggedOut = blankPage || Boolean(blocker) || page.url().includes("/web/user") || loginControlsVisible || (loginText && signals.cardCount === 0);
 
     if (looksLoggedOut) {
       return { ok: false, blocker: blocker || LOGIN_REQUIRED, signals };
@@ -427,12 +465,37 @@ export class BossRunner extends EventEmitter {
   }
 
   async openLoginPage(page) {
-    if (!page || page.isClosed()) return;
+    if (!page || page.isClosed()) return false;
+    await page.bringToFront().catch(() => {});
+    let lastError = "";
     await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30000 }).catch((error) => {
+      lastError = error.message;
       this.emitLog(`Login page navigation did not finish: ${error.message}`, "warn");
     });
     await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
+    if (isBossPage(page.url())) {
+      await page.bringToFront().catch(() => {});
+      return true;
+    }
+
+    const shortcut = process.platform === "darwin" ? "Meta+L" : "Control+L";
     await page.bringToFront().catch(() => {});
+    await page.keyboard.press(shortcut).catch((error) => {
+      lastError = error.message;
+    });
+    await page.keyboard.type(LOGIN_URL, { delay: 1 }).catch((error) => {
+      lastError = error.message;
+    });
+    await page.keyboard.press("Enter").catch((error) => {
+      lastError = error.message;
+    });
+    await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+    await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
+    await page.bringToFront().catch(() => {});
+    if (isBossPage(page.url())) return true;
+
+    this.emitLog(`Login page still not open; current URL: ${page.url()}${lastError ? `; last error: ${lastError}` : ""}`, "warn");
+    return false;
   }
 
   async collectCards(page) {
@@ -586,6 +649,10 @@ function isProfileInUseError(error) {
 
 function isLoginBlocker(blocker) {
   return /login|captcha|security|登录|扫码|验证码|安全验证/i.test(String(blocker || ""));
+}
+
+function isBossPage(url) {
+  return /^https?:\/\/([^/]+\.)?zhipin\.com\//i.test(String(url || ""));
 }
 
 async function readLoginSignals(page) {
