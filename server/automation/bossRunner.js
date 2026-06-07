@@ -173,7 +173,10 @@ export class BossRunner extends EventEmitter {
         await launchLoginChrome(profileDir);
         await waitForLoginDebug();
       }
-      await openUrlInLoginChrome(LOGIN_URL);
+      const loginTab = await openUrlInLoginChrome(LOGIN_URL);
+      if (!loginTab) {
+        throw new Error("BOSS 登录标签页没有保持打开，请重新点击打开登录");
+      }
       this.updateStatus({
         state: "waitingLogin",
         message: "请在打开的普通 Chrome 登录页完成登录；完成后再点击开始复审或自动投递",
@@ -416,8 +419,11 @@ export class BossRunner extends EventEmitter {
     const currentPage = await this.inspectCurrentLoginState(page);
     if (!currentPage.ok) {
       const blocker = currentPage.blocker || LOGIN_REQUIRED;
+      await this.openLogin(config).catch((error) => {
+        this.emitLog(`Could not reopen login page: ${error.message}`, "warn");
+      });
       this.updateStatus({
-        state: "blocked",
+        state: "waitingLogin",
         blocker,
         message: "请先在打开的 BOSS 登录页完成登录",
         currentCity: "",
@@ -433,10 +439,12 @@ export class BossRunner extends EventEmitter {
       return { ok: true, url: page.url() };
     }
 
-    await this.openLoginPage(page);
+    await this.openLogin(config).catch((error) => {
+      this.emitLog(`Could not reopen login page: ${error.message}`, "warn");
+    });
     const blocker = inspected.blocker || LOGIN_REQUIRED;
     this.updateStatus({
-      state: "blocked",
+      state: "waitingLogin",
       blocker,
       message: "请先在打开的 BOSS 登录页完成登录",
       currentCity: "",
@@ -759,22 +767,32 @@ async function openUrlInLoginChrome(url) {
   if (existing?.id) {
     await closeDuplicateLoginTabs(existing.id, url).catch(() => {});
     await fetch(`${LOGIN_DEBUG_URL}/json/activate/${existing.id}`, { signal: AbortSignal.timeout(1500) }).catch(() => {});
-    return true;
+    await activateChromeApp().catch(() => {});
+    return waitForLoginTab(url, 4000);
   }
 
   const encoded = encodeURIComponent(url);
-  for (const method of ["PUT", "GET"]) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const response = await fetch(`${LOGIN_DEBUG_URL}/json/new?${encoded}`, {
-        method,
+        method: "PUT",
         signal: AbortSignal.timeout(2500),
       });
-      if (response.ok) return true;
+      if (response.ok) {
+        const opened = await waitForLoginTab(url, 5000);
+        if (opened?.id) {
+          await closeDuplicateLoginTabs(opened.id, url).catch(() => {});
+          await fetch(`${LOGIN_DEBUG_URL}/json/activate/${opened.id}`, { signal: AbortSignal.timeout(1500) }).catch(() => {});
+          await activateChromeApp().catch(() => {});
+          return opened;
+        }
+      }
     } catch {
-      // Try the next method; Chrome versions differ on this endpoint.
+      // Retry below; Chrome may report the target before it appears in /json/list.
     }
+    await delay(500);
   }
-  return false;
+  return null;
 }
 
 async function findLoginChromeTab(url) {
@@ -782,6 +800,16 @@ async function findLoginChromeTab(url) {
   if (!response.ok) return null;
   const tabs = await response.json();
   return tabs.find((tab) => tab.type === "page" && tab.url === url) || tabs.find((tab) => tab.type === "page" && isBossPage(tab.url));
+}
+
+async function waitForLoginTab(url, timeoutMs) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const tab = await findLoginChromeTab(url).catch(() => null);
+    if (tab?.id) return tab;
+    await delay(250);
+  }
+  return null;
 }
 
 async function closeDuplicateLoginTabs(keepId, url) {
@@ -838,6 +866,11 @@ function isChromeProcessLine(line) {
     return /^\d+\s+\/Applications\/Google Chrome\.app\//.test(line);
   }
   return /^\d+\s+.*\b(chrome|chromium|google-chrome)\b/i.test(line);
+}
+
+async function activateChromeApp() {
+  if (process.platform !== "darwin") return;
+  await execFileAsync("osascript", ["-e", 'tell application "Google Chrome" to activate']);
 }
 
 function spawnDetached(command, args) {
