@@ -134,7 +134,12 @@ export class BossRunner extends EventEmitter {
       startedAt: nowIso(),
     });
     this.run(config, runLog).catch((error) => {
-      this.updateStatus({ state: "error", message: error.message, blocker: error.message });
+      const browserClosed = isBrowserClosedError(error);
+      this.updateStatus({
+        state: browserClosed ? "blocked" : "error",
+        message: browserClosed ? "Automation browser was closed" : error.message,
+        blocker: browserClosed ? "automation browser closed; run preflight again" : error.message,
+      });
       this.emitLog(error.stack || error.message, "error");
     });
     return this.getStatus();
@@ -293,35 +298,48 @@ export class BossRunner extends EventEmitter {
   }
 
   async collectCards(page) {
-    return page.locator(".job-card-wrap").evaluateAll((nodes) =>
-      nodes.map((el, index) => {
-        const lines = (el.innerText || "")
-          .split("\n")
-          .map((line) => line.trim())
-          .filter(Boolean);
-        const rect = el.getBoundingClientRect();
-        return {
-          index,
-          title: lines[0] || "",
-          salary: lines[1] || "",
-          meta: lines.slice(2, 4).join(" "),
-          company: lines[4] || "",
-          location: lines.slice(5).join(" "),
-          visible: rect.width > 0 && rect.height > 0,
-        };
-      }),
-    ).then((cards) =>
-      cards
-        .filter((card) => card.visible)
-        .map((card) => ({
-          ...card,
-          title: normalizeText(card.title),
-          salary: normalizeText(card.salary),
-          meta: normalizeText(card.meta),
-          company: normalizeText(card.company),
-          location: normalizeText(card.location),
-        })),
-    );
+    if (!page || page.isClosed()) {
+      throw new Error("automation browser closed; run preflight again");
+    }
+    try {
+      return await page
+        .locator(".job-card-wrap")
+        .evaluateAll((nodes) =>
+          nodes.map((el, index) => {
+            const lines = (el.innerText || "")
+              .split("\n")
+              .map((line) => line.trim())
+              .filter(Boolean);
+            const rect = el.getBoundingClientRect();
+            return {
+              index,
+              title: lines[0] || "",
+              salary: lines[1] || "",
+              meta: lines.slice(2, 4).join(" "),
+              company: lines[4] || "",
+              location: lines.slice(5).join(" "),
+              visible: rect.width > 0 && rect.height > 0,
+            };
+          }),
+        )
+        .then((cards) =>
+          cards
+            .filter((card) => card.visible)
+            .map((card) => ({
+              ...card,
+              title: normalizeText(card.title),
+              salary: normalizeText(card.salary),
+              meta: normalizeText(card.meta),
+              company: normalizeText(card.company),
+              location: normalizeText(card.location),
+            })),
+        );
+    } catch (error) {
+      if (isBrowserClosedError(error)) {
+        throw new Error("automation browser closed; run preflight again");
+      }
+      throw error;
+    }
   }
 
   async clickCard(page, index) {
@@ -411,4 +429,10 @@ function candidateKey(candidate) {
 
 function formatCandidate(candidate) {
   return [candidate.company, candidate.title, candidate.salary, candidate.location].map((part) => normalizeText(part || "-")).join(" | ");
+}
+
+function isBrowserClosedError(error) {
+  return /Target page, context or browser has been closed|Browser has been closed|Target closed|Page closed|automation browser closed/i.test(
+    String(error?.message || error || ""),
+  );
 }

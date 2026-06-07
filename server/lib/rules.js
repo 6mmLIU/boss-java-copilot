@@ -171,7 +171,11 @@ function blockReason(text, title, config) {
 
 export function detectSecurityBlocker(text = "") {
   const body = normalizeText(text);
-  if (/安全验证|身份验证|验证身份|滑块|拖动.*验证|验证码|人机验证|请完成验证|扫码登录|登录后继续|请先登录/.test(body)) {
+  if (
+    /安全验证|身份验证|验证身份|滑块|拖动.*验证|验证码|人机验证|请完成验证|扫码登录|扫码.*登录|微信登录|手机号登录|密码登录|登录后继续|请先登录|登录 \/ 注册|BOSS直聘 APP/.test(
+      body,
+    )
+  ) {
     return "login/captcha/security";
   }
   if (/今日沟通已达上限|沟通次数已用完|打招呼次数已达上限/.test(body)) {
