@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
@@ -8,7 +9,8 @@ import { detectSecurityBlocker, normalizeText, readAllLogCandidates, screenJob }
 const SEARCH_BASE = "https://www.zhipin.com/web/geek/jobs";
 const LOGIN_URL = "https://www.zhipin.com/web/user/?ka=header-login";
 const LOGIN_CHECK_URL = `${SEARCH_BASE}?query=Java&city=100010000`;
-const LOGIN_REQUIRED = "login required; finish login in the opened BOSS window before running";
+const LOGIN_REQUIRED = "请先在打开的 BOSS 登录页完成登录，再继续运行";
+const PROFILE_IN_USE = "浏览器配置目录已被旧自动化窗口占用";
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -58,8 +60,15 @@ export class BossRunner extends EventEmitter {
     this.emit("log", payload);
   }
 
-  async ensureContext(config = defaultConfig) {
-    if (this.context && this.page && !this.page.isClosed()) return this.page;
+  async ensureContext(config = defaultConfig, options = {}) {
+    const initialUrl = options.initialUrl || "";
+    const forceNavigate = Boolean(options.forceNavigate);
+    if (this.context && this.page && !this.page.isClosed()) {
+      if (initialUrl && forceNavigate) {
+        await this.openLoginPage(this.page);
+      }
+      return this.page;
+    }
 
     const profileDir = path.resolve(this.rootDir, config.profileDir || "data/browser-profile");
     await fs.mkdir(profileDir, { recursive: true });
@@ -73,7 +82,20 @@ export class BossRunner extends EventEmitter {
       launchOptions.channel = "chrome";
     }
 
-    this.context = await chromium.launchPersistentContext(profileDir, launchOptions);
+    try {
+      this.context = await chromium.launchPersistentContext(profileDir, launchOptions);
+    } catch (error) {
+      if (isProfileInUseError(error)) {
+        await openLoginInExternalChrome(profileDir, config).catch((openError) => {
+          this.emitLog(`Failed to open login page in existing Chrome: ${openError.message}`, "warn");
+        });
+        const wrapped = new Error(PROFILE_IN_USE);
+        wrapped.code = "BROWSER_PROFILE_IN_USE";
+        wrapped.cause = error;
+        throw wrapped;
+      }
+      throw error;
+    }
     this.page = this.context.pages()[0] || (await this.context.newPage());
     this.page.setDefaultTimeout(9000);
     this.page.on("close", () => {
@@ -83,11 +105,14 @@ export class BossRunner extends EventEmitter {
       this.context = null;
       this.page = null;
     });
+    if (initialUrl) {
+      await this.openLoginPage(this.page);
+    }
     return this.page;
   }
 
   async preflight(config = defaultConfig) {
-    this.updateStatus({ state: "preflight", message: "Checking BOSS login before run" });
+    this.updateStatus({ state: "preflight", message: "正在打开 BOSS 登录页" });
     const result = await this.requireLoggedIn(config);
     if (!result.ok) return result;
     this.updateStatus({ state: "idle", blocker: "", message: "Browser ready" });
@@ -297,7 +322,30 @@ export class BossRunner extends EventEmitter {
   }
 
   async requireLoggedIn(config) {
-    const page = await this.ensureContext(config);
+    let page;
+    try {
+      page = await this.ensureContext(config, { initialUrl: LOGIN_URL, forceNavigate: true });
+    } catch (error) {
+      if (isProfileInUseError(error)) {
+        return this.blockOnProfileInUse(error);
+      }
+      throw error;
+    }
+
+    const currentPage = await this.inspectCurrentLoginState(page);
+    if (!currentPage.ok) {
+      const blocker = currentPage.blocker || LOGIN_REQUIRED;
+      this.updateStatus({
+        state: "blocked",
+        blocker,
+        message: "请先在打开的 BOSS 登录页完成登录",
+        currentCity: "",
+        currentQuery: "",
+      });
+      this.emitLog(`Login gate blocked: ${blocker}`, "warn");
+      return { ok: false, blocker, url: page.url() };
+    }
+
     const inspected = await this.inspectLoginState(page);
     if (inspected.ok) {
       this.emitLog("Login gate passed");
@@ -309,12 +357,47 @@ export class BossRunner extends EventEmitter {
     this.updateStatus({
       state: "blocked",
       blocker,
-      message: "Please log in in the opened BOSS window before running",
+      message: "请先在打开的 BOSS 登录页完成登录",
       currentCity: "",
       currentQuery: "",
     });
     this.emitLog(`Login gate blocked: ${blocker}`, "warn");
     return { ok: false, blocker, url: page.url() };
+  }
+
+  blockOnProfileInUse(error) {
+    this.context = null;
+    this.page = null;
+    this.updateStatus({
+      state: "blocked",
+      blocker: PROFILE_IN_USE,
+      message: "已尝试把 BOSS 登录页打开到旧自动化窗口；登录后请关闭旧窗口，再点预检登录",
+      currentCity: "",
+      currentQuery: "",
+    });
+    this.emitLog(`${PROFILE_IN_USE}: ${error.cause?.message || error.message}`, "warn");
+    return { ok: false, blocker: PROFILE_IN_USE, url: LOGIN_URL };
+  }
+
+  async inspectCurrentLoginState(page) {
+    if (!page || page.isClosed()) {
+      return { ok: false, blocker: "automation browser closed; run preflight again" };
+    }
+
+    await page.waitForLoadState("domcontentloaded", { timeout: 12000 }).catch(() => {});
+    await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
+    await page.bringToFront().catch(() => {});
+    const signals = await readLoginSignals(page);
+    const bodyHead = normalizeText(signals.bodyHead);
+    const blocker = detectSecurityBlocker(bodyHead);
+    const loginText = /登录|注册|扫码|验证码|微信登录|手机号登录|密码登录|登录 \/ 注册|BOSS直聘 APP/.test(bodyHead);
+    const loginControlsVisible = signals.loginControlCount > 0;
+    const looksLoggedOut = Boolean(blocker) || page.url().includes("/web/user") || loginControlsVisible || (loginText && signals.cardCount === 0);
+
+    if (looksLoggedOut) {
+      return { ok: false, blocker: blocker || LOGIN_REQUIRED, signals };
+    }
+    return { ok: true, signals };
   }
 
   async inspectLoginState(page) {
@@ -326,21 +409,7 @@ export class BossRunner extends EventEmitter {
     await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
     await page.bringToFront().catch(() => {});
 
-    const signals = await page
-      .evaluate(() => {
-        const visibleText = (document.body.innerText || "").replace(/\s+/g, " ").trim();
-        const bodyHead = visibleText.slice(0, 3000);
-        const cardCount = document.querySelectorAll(".job-card-wrap").length;
-        const chatButtonCount = document.querySelectorAll(".op-btn-chat").length;
-        const loginControlCount = [...document.querySelectorAll("a, button, .btn, .nav-item, .login-btn, .header-login")]
-          .filter((el) => {
-            const rect = el.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0 && /登录|注册|扫码|验证码|微信|手机号/.test(el.innerText || "");
-          })
-          .length;
-        return { bodyHead, cardCount, chatButtonCount, loginControlCount };
-      })
-      .catch(() => ({ bodyHead: "", cardCount: 0, chatButtonCount: 0, loginControlCount: 0 }));
+    const signals = await readLoginSignals(page);
 
     const bodyHead = normalizeText(signals.bodyHead);
     const blocker = detectSecurityBlocker(bodyHead);
@@ -359,7 +428,9 @@ export class BossRunner extends EventEmitter {
 
   async openLoginPage(page) {
     if (!page || page.isClosed()) return;
-    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => page.goto(SEARCH_BASE, { waitUntil: "domcontentloaded" }));
+    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30000 }).catch((error) => {
+      this.emitLog(`Login page navigation did not finish: ${error.message}`, "warn");
+    });
     await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
     await page.bringToFront().catch(() => {});
   }
@@ -507,6 +578,61 @@ function isBrowserClosedError(error) {
   );
 }
 
+function isProfileInUseError(error) {
+  return /BROWSER_PROFILE_IN_USE|正在现有的浏览器会话中打开|ProcessSingleton|SingletonLock|user data directory is already in use|profile.*in use/i.test(
+    String(error?.code || "") + "\n" + String(error?.message || error || "") + "\n" + String(error?.cause?.message || ""),
+  );
+}
+
 function isLoginBlocker(blocker) {
   return /login|captcha|security|登录|扫码|验证码|安全验证/i.test(String(blocker || ""));
+}
+
+async function readLoginSignals(page) {
+  return page
+    .evaluate(() => {
+      const visibleText = (document.body.innerText || "").replace(/\s+/g, " ").trim();
+      const bodyHead = visibleText.slice(0, 3000);
+      const cardCount = document.querySelectorAll(".job-card-wrap").length;
+      const chatButtonCount = document.querySelectorAll(".op-btn-chat").length;
+      const loginControlCount = [...document.querySelectorAll("a, button, .btn, .nav-item, .login-btn, .header-login")]
+        .filter((el) => {
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && /登录|注册|扫码|验证码|微信|手机号/.test(el.innerText || "");
+        })
+        .length;
+      return { bodyHead, cardCount, chatButtonCount, loginControlCount };
+    })
+    .catch(() => ({ bodyHead: "", cardCount: 0, chatButtonCount: 0, loginControlCount: 0 }));
+}
+
+async function openLoginInExternalChrome(profileDir, config = defaultConfig) {
+  if (process.platform === "darwin") {
+    await spawnDetached("open", ["-na", "Google Chrome", "--args", `--user-data-dir=${profileDir}`, LOGIN_URL]);
+    return;
+  }
+  if (process.platform === "win32") {
+    await spawnDetached("cmd", ["/c", "start", "", "chrome", `--user-data-dir=${profileDir}`, LOGIN_URL]);
+    return;
+  }
+  const command = config.browserChannel === "chrome" ? "google-chrome" : "chromium";
+  await spawnDetached(command, [`--user-data-dir=${profileDir}`, LOGIN_URL]);
+}
+
+function spawnDetached(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { detached: true, stdio: "ignore" });
+    let settled = false;
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    child.unref();
+    setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    }, 250);
+  });
 }

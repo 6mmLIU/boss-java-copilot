@@ -259,7 +259,7 @@ function App() {
     try {
       const payload = await fn();
       if (payload.status) setStatus(payload.status);
-      setNotice("命令已发送");
+      setNotice(payload.status?.message || "命令已发送");
       window.setTimeout(refreshCandidates, 900);
     } catch (err) {
       setError(err.message);
