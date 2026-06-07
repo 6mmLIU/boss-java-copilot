@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Cross-platform local BOSS Java job application copilot with review UI, filters, Playwright automation, and audit logs.",
+  "description": "本地优先的 BOSS 直聘 Java 岗位筛选与受控投递工作台。",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
