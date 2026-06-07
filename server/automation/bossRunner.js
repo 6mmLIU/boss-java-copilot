@@ -6,6 +6,9 @@ import { defaultConfig } from "../lib/defaults.js";
 import { detectSecurityBlocker, normalizeText, readAllLogCandidates, screenJob } from "../lib/rules.js";
 
 const SEARCH_BASE = "https://www.zhipin.com/web/geek/jobs";
+const LOGIN_URL = "https://www.zhipin.com/web/user/?ka=header-login";
+const LOGIN_CHECK_URL = `${SEARCH_BASE}?query=Java&city=100010000`;
+const LOGIN_REQUIRED = "login required; finish login in the opened BOSS window before running";
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -84,20 +87,12 @@ export class BossRunner extends EventEmitter {
   }
 
   async preflight(config = defaultConfig) {
-    this.updateStatus({ state: "preflight", message: "Opening BOSS in Chrome" });
-    const page = await this.ensureContext(config);
-    await page.goto(SEARCH_BASE, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
-    const body = normalizeText(await page.locator("body").innerText({ timeout: 5000 }).catch(() => ""));
-    const blocker = detectSecurityBlocker(body);
-    if (blocker) {
-      this.updateStatus({ state: "blocked", blocker, message: "Login or security check required" });
-      this.emitLog(`Preflight blocked: ${blocker}`, "warn");
-      return { ok: false, blocker, url: page.url() };
-    }
+    this.updateStatus({ state: "preflight", message: "Checking BOSS login before run" });
+    const result = await this.requireLoggedIn(config);
+    if (!result.ok) return result;
     this.updateStatus({ state: "idle", blocker: "", message: "Browser ready" });
     this.emitLog("Preflight passed");
-    return { ok: true, url: page.url() };
+    return result;
   }
 
   async start(configInput = {}) {
@@ -106,6 +101,10 @@ export class BossRunner extends EventEmitter {
     }
     const config = this.normalizeConfig(configInput);
     this.abortRequested = false;
+    const login = await this.requireLoggedIn(config);
+    if (!login.ok) {
+      return this.getStatus();
+    }
     const runLog = path.join(this.rootDir, "data", "runs", `boss-java-run-${safeFileStamp()}.md`);
     await fs.mkdir(path.dirname(runLog), { recursive: true });
     await fs.writeFile(
@@ -197,7 +196,7 @@ export class BossRunner extends EventEmitter {
           if (this.shouldStop(applied, config.target)) break;
           const blocker = await this.detectPageBlocker(page);
           if (blocker) {
-            await this.block(runLog, blocker);
+            await this.block(runLog, blocker, page);
             return;
           }
 
@@ -248,7 +247,7 @@ export class BossRunner extends EventEmitter {
 
             const sent = await this.clickChat(page);
             if (sent.blocker) {
-              await this.block(runLog, sent.blocker);
+              await this.block(runLog, sent.blocker, page);
               return;
             }
             if (!sent.ok) {
@@ -295,6 +294,74 @@ export class BossRunner extends EventEmitter {
   async detectPageBlocker(page) {
     const body = normalizeText(await page.locator("body").innerText({ timeout: 5000 }).catch(() => ""));
     return detectSecurityBlocker(body);
+  }
+
+  async requireLoggedIn(config) {
+    const page = await this.ensureContext(config);
+    const inspected = await this.inspectLoginState(page);
+    if (inspected.ok) {
+      this.emitLog("Login gate passed");
+      return { ok: true, url: page.url() };
+    }
+
+    await this.openLoginPage(page);
+    const blocker = inspected.blocker || LOGIN_REQUIRED;
+    this.updateStatus({
+      state: "blocked",
+      blocker,
+      message: "Please log in in the opened BOSS window before running",
+      currentCity: "",
+      currentQuery: "",
+    });
+    this.emitLog(`Login gate blocked: ${blocker}`, "warn");
+    return { ok: false, blocker, url: page.url() };
+  }
+
+  async inspectLoginState(page) {
+    if (!page || page.isClosed()) {
+      return { ok: false, blocker: "automation browser closed; run preflight again" };
+    }
+
+    await page.goto(LOGIN_CHECK_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
+    await page.bringToFront().catch(() => {});
+
+    const signals = await page
+      .evaluate(() => {
+        const visibleText = (document.body.innerText || "").replace(/\s+/g, " ").trim();
+        const bodyHead = visibleText.slice(0, 3000);
+        const cardCount = document.querySelectorAll(".job-card-wrap").length;
+        const chatButtonCount = document.querySelectorAll(".op-btn-chat").length;
+        const loginControlCount = [...document.querySelectorAll("a, button, .btn, .nav-item, .login-btn, .header-login")]
+          .filter((el) => {
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && /登录|注册|扫码|验证码|微信|手机号/.test(el.innerText || "");
+          })
+          .length;
+        return { bodyHead, cardCount, chatButtonCount, loginControlCount };
+      })
+      .catch(() => ({ bodyHead: "", cardCount: 0, chatButtonCount: 0, loginControlCount: 0 }));
+
+    const bodyHead = normalizeText(signals.bodyHead);
+    const blocker = detectSecurityBlocker(bodyHead);
+    const loginText = /登录|注册|扫码|验证码|微信登录|手机号登录|密码登录|登录 \/ 注册|BOSS直聘 APP/.test(bodyHead);
+    const loginControlsVisible = signals.loginControlCount > 0;
+    const looksLoggedOut = Boolean(blocker) || page.url().includes("/web/user") || loginControlsVisible || (loginText && signals.cardCount === 0);
+
+    if (looksLoggedOut) {
+      return { ok: false, blocker: blocker || LOGIN_REQUIRED, signals };
+    }
+    if (signals.cardCount > 0 || signals.chatButtonCount > 0) {
+      return { ok: true, signals };
+    }
+    return { ok: false, blocker: LOGIN_REQUIRED, signals };
+  }
+
+  async openLoginPage(page) {
+    if (!page || page.isClosed()) return;
+    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => page.goto(SEARCH_BASE, { waitUntil: "domcontentloaded" }));
+    await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
+    await page.bringToFront().catch(() => {});
   }
 
   async collectCards(page) {
@@ -411,7 +478,10 @@ export class BossRunner extends EventEmitter {
     return true;
   }
 
-  async block(runLog, blocker) {
+  async block(runLog, blocker, page = null) {
+    if (isLoginBlocker(blocker) && page && !page.isClosed()) {
+      await this.openLoginPage(page);
+    }
     await this.appendRun(runLog, `- Blocked: ${blocker}`);
     this.updateStatus({ state: "blocked", blocker, message: "Manual action required" });
     this.emitLog(`Blocked: ${blocker}`, "warn");
@@ -435,4 +505,8 @@ function isBrowserClosedError(error) {
   return /Target page, context or browser has been closed|Browser has been closed|Target closed|Page closed|automation browser closed/i.test(
     String(error?.message || error || ""),
   );
+}
+
+function isLoginBlocker(blocker) {
+  return /login|captcha|security|登录|扫码|验证码|安全验证/i.test(String(blocker || ""));
 }
