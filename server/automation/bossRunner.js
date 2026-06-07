@@ -1,7 +1,8 @@
 import { EventEmitter } from "node:events";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 import { chromium } from "playwright";
 import { defaultConfig } from "../lib/defaults.js";
 import { detectSecurityBlocker, normalizeText, readAllLogCandidates, screenJob } from "../lib/rules.js";
@@ -11,6 +12,9 @@ const LOGIN_URL = "https://www.zhipin.com/web/user/?ka=header-login";
 const LOGIN_CHECK_URL = `${SEARCH_BASE}?query=Java&city=100010000`;
 const LOGIN_REQUIRED = "请先在打开的 BOSS 登录页完成登录，再继续运行";
 const PROFILE_IN_USE = "浏览器配置目录已被旧自动化窗口占用";
+const LOGIN_DEBUG_PORT = Number(process.env.BOSS_CHROME_DEBUG_PORT || 9227);
+const LOGIN_DEBUG_URL = `http://127.0.0.1:${LOGIN_DEBUG_PORT}`;
+const execFileAsync = promisify(execFile);
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -28,6 +32,7 @@ export class BossRunner extends EventEmitter {
   constructor({ rootDir }) {
     super();
     this.rootDir = rootDir;
+    this.browser = null;
     this.context = null;
     this.page = null;
     this.abortRequested = false;
@@ -72,6 +77,29 @@ export class BossRunner extends EventEmitter {
 
     const profileDir = path.resolve(this.rootDir, config.profileDir || "data/browser-profile");
     await fs.mkdir(profileDir, { recursive: true });
+    const cdpBrowser = await this.connectToLoginChrome().catch((error) => {
+      this.emitLog(`Chrome debug connection is not ready: ${error.message}`, "warn");
+      return null;
+    });
+    if (cdpBrowser) {
+      this.browser = cdpBrowser;
+      this.context = cdpBrowser.contexts()[0];
+      this.page = this.context.pages().find((candidate) => !candidate.isClosed()) || (await this.context.newPage());
+      this.page.setDefaultTimeout(9000);
+      this.page.on("close", () => {
+        this.page = null;
+      });
+      cdpBrowser.on("disconnected", () => {
+        this.browser = null;
+        this.context = null;
+        this.page = null;
+      });
+      if (initialUrl && forceNavigate) {
+        await this.openLoginPage(this.page);
+      }
+      return this.page;
+    }
+
     const launchOptions = {
       headless: Boolean(config.headless),
       viewport: { width: 1440, height: 960 },
@@ -86,9 +114,6 @@ export class BossRunner extends EventEmitter {
       this.context = await chromium.launchPersistentContext(profileDir, launchOptions);
     } catch (error) {
       if (isProfileInUseError(error)) {
-        await openLoginInExternalChrome(profileDir, config).catch((openError) => {
-          this.emitLog(`Failed to open login page in existing Chrome: ${openError.message}`, "warn");
-        });
         const wrapped = new Error(PROFILE_IN_USE);
         wrapped.code = "BROWSER_PROFILE_IN_USE";
         wrapped.cause = error;
@@ -111,6 +136,11 @@ export class BossRunner extends EventEmitter {
     return this.page;
   }
 
+  async connectToLoginChrome() {
+    if (!(await isLoginDebugReady())) return null;
+    return chromium.connectOverCDP(LOGIN_DEBUG_URL);
+  }
+
   async preflight(config = defaultConfig) {
     this.updateStatus({ state: "preflight", message: "正在打开 BOSS 登录页" });
     const result = await this.requireLoggedIn(config);
@@ -130,24 +160,29 @@ export class BossRunner extends EventEmitter {
       currentQuery: "",
     });
     try {
-      const page = await this.ensureContext(config, { initialUrl: LOGIN_URL, forceNavigate: true });
-      const opened = await this.openLoginPage(page);
-      if (!opened) {
-        await openLoginInExternalChrome(path.resolve(this.rootDir, config.profileDir || "data/browser-profile"), config).catch((error) => {
-          this.emitLog(`External login page fallback failed: ${error.message}`, "warn");
+      const profileDir = path.resolve(this.rootDir, config.profileDir || "data/browser-profile");
+      await fs.mkdir(profileDir, { recursive: true });
+      const debugReady = await isLoginDebugReady();
+      if (!debugReady) {
+        this.browser = null;
+        this.context = null;
+        this.page = null;
+        await closeChromeForProfile(profileDir).catch((error) => {
+          this.emitLog(`Could not clean old login Chrome: ${error.message}`, "warn");
         });
+        await launchLoginChrome(profileDir);
+        await waitForLoginDebug();
       }
+      await openUrlInLoginChrome(LOGIN_URL);
       this.updateStatus({
         state: "waitingLogin",
-        message: opened
-          ? "请在打开的 BOSS 登录页完成登录；完成后再点击开始复审或自动投递"
-          : "已尝试打开 BOSS 登录页；如果仍是空白，请关闭旧自动化窗口后再点打开登录",
+        message: "请在打开的普通 Chrome 登录页完成登录；完成后再点击开始复审或自动投递",
         blocker: "",
         currentCity: "",
         currentQuery: "",
       });
       this.emitLog("Login page opened; waiting for manual login");
-      return { ok: true, url: opened ? page.url() : LOGIN_URL };
+      return { ok: true, url: LOGIN_URL };
     } catch (error) {
       if (isProfileInUseError(error)) {
         return this.blockOnProfileInUse(error);
@@ -213,9 +248,13 @@ export class BossRunner extends EventEmitter {
   }
 
   async closeBrowser() {
+    if (this.browser) {
+      await this.browser.close().catch(() => {});
+    }
     if (this.context) {
       await this.context.close().catch(() => {});
     }
+    this.browser = null;
     this.context = null;
     this.page = null;
     this.updateStatus({ state: "idle", message: "Browser closed" });
@@ -361,7 +400,12 @@ export class BossRunner extends EventEmitter {
     let page;
     try {
       const hasLivePage = this.context && this.page && !this.page.isClosed();
-      page = hasLivePage ? await this.ensureContext(config) : await this.ensureContext(config, { initialUrl: LOGIN_URL, forceNavigate: true });
+      const debugReady = await isLoginDebugReady();
+      if (!hasLivePage && !debugReady) {
+        await this.openLogin(config);
+        return { ok: false, blocker: LOGIN_REQUIRED, url: LOGIN_URL };
+      }
+      page = await this.ensureContext(config);
     } catch (error) {
       if (isProfileInUseError(error)) {
         return this.blockOnProfileInUse(error);
@@ -673,17 +717,127 @@ async function readLoginSignals(page) {
     .catch(() => ({ bodyHead: "", cardCount: 0, chatButtonCount: 0, loginControlCount: 0 }));
 }
 
-async function openLoginInExternalChrome(profileDir, config = defaultConfig) {
+async function launchLoginChrome(profileDir) {
+  const args = [
+    `--remote-debugging-port=${LOGIN_DEBUG_PORT}`,
+    `--user-data-dir=${profileDir}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    LOGIN_URL,
+  ];
   if (process.platform === "darwin") {
-    await spawnDetached("open", ["-na", "Google Chrome", "--args", `--user-data-dir=${profileDir}`, LOGIN_URL]);
+    await spawnDetached("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", args);
     return;
   }
   if (process.platform === "win32") {
-    await spawnDetached("cmd", ["/c", "start", "", "chrome", `--user-data-dir=${profileDir}`, LOGIN_URL]);
+    await spawnDetached("cmd", ["/c", "start", "", "chrome", ...args]);
     return;
   }
-  const command = config.browserChannel === "chrome" ? "google-chrome" : "chromium";
-  await spawnDetached(command, [`--user-data-dir=${profileDir}`, LOGIN_URL]);
+  await spawnDetached("google-chrome", args).catch(() => spawnDetached("chromium", args));
+}
+
+async function isLoginDebugReady() {
+  try {
+    const response = await fetch(`${LOGIN_DEBUG_URL}/json/version`, { signal: AbortSignal.timeout(1000) });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForLoginDebug(timeoutMs = 8000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (await isLoginDebugReady()) return true;
+    await delay(250);
+  }
+  throw new Error("普通 Chrome 登录窗口启动超时");
+}
+
+async function openUrlInLoginChrome(url) {
+  const existing = await findLoginChromeTab(url).catch(() => null);
+  if (existing?.id) {
+    await closeDuplicateLoginTabs(existing.id, url).catch(() => {});
+    await fetch(`${LOGIN_DEBUG_URL}/json/activate/${existing.id}`, { signal: AbortSignal.timeout(1500) }).catch(() => {});
+    return true;
+  }
+
+  const encoded = encodeURIComponent(url);
+  for (const method of ["PUT", "GET"]) {
+    try {
+      const response = await fetch(`${LOGIN_DEBUG_URL}/json/new?${encoded}`, {
+        method,
+        signal: AbortSignal.timeout(2500),
+      });
+      if (response.ok) return true;
+    } catch {
+      // Try the next method; Chrome versions differ on this endpoint.
+    }
+  }
+  return false;
+}
+
+async function findLoginChromeTab(url) {
+  const response = await fetch(`${LOGIN_DEBUG_URL}/json/list`, { signal: AbortSignal.timeout(1500) });
+  if (!response.ok) return null;
+  const tabs = await response.json();
+  return tabs.find((tab) => tab.type === "page" && tab.url === url) || tabs.find((tab) => tab.type === "page" && isBossPage(tab.url));
+}
+
+async function closeDuplicateLoginTabs(keepId, url) {
+  const response = await fetch(`${LOGIN_DEBUG_URL}/json/list`, { signal: AbortSignal.timeout(1500) });
+  if (!response.ok) return;
+  const tabs = await response.json();
+  const duplicates = tabs.filter((tab) => tab.type === "page" && tab.id !== keepId && (tab.url === url || isBossPage(tab.url)));
+  for (const tab of duplicates) {
+    await fetch(`${LOGIN_DEBUG_URL}/json/close/${tab.id}`, { signal: AbortSignal.timeout(1000) }).catch(() => {});
+  }
+}
+
+async function closeChromeForProfile(profileDir) {
+  if (process.platform === "win32") {
+    const escaped = profileDir.replace(/'/g, "''");
+    await execFileAsync("powershell.exe", [
+      "-NoProfile",
+      "-Command",
+      `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${escaped}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`,
+    ]).catch(() => {});
+    return;
+  }
+
+  const psArgs = process.platform === "darwin" ? ["-axo", "pid=,command="] : ["-eo", "pid=,command="];
+  const { stdout } = await execFileAsync("ps", psArgs);
+  const ownChromePids = stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => isChromeProcessLine(line))
+    .filter((line) => line.includes(profileDir))
+    .map((line) => Number(line.match(/^\d+/)?.[0]))
+    .filter(Boolean)
+    .filter((pid) => pid !== process.pid);
+  for (const pid of ownChromePids) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // Already exited.
+    }
+  }
+  if (ownChromePids.length) await delay(800);
+  for (const pid of ownChromePids) {
+    try {
+      process.kill(pid, 0);
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Already exited.
+    }
+  }
+}
+
+function isChromeProcessLine(line) {
+  if (process.platform === "darwin") {
+    return /^\d+\s+\/Applications\/Google Chrome\.app\//.test(line);
+  }
+  return /^\d+\s+.*\b(chrome|chromium|google-chrome)\b/i.test(line);
 }
 
 function spawnDetached(command, args) {
