@@ -286,6 +286,10 @@ export class BossRunner extends EventEmitter {
   }
 
   async run(config, runLog) {
+    if (await isLoginDebugReady()) {
+      return this.runCdp(config, runLog);
+    }
+
     const page = await this.ensureContext(config);
     const { candidates: historical } = await readAllLogCandidates(this.rootDir).catch(() => ({ candidates: [] }));
     const seen = new Set(historical.map((item) => candidateKey(item)));
@@ -388,6 +392,124 @@ export class BossRunner extends EventEmitter {
     await this.appendRun(runLog, `- Screened: ${screened}`);
     await this.appendRun(runLog, `- Skipped: ${skipped}`);
     this.updateStatus({ state, applied, screened, skipped, message, currentCity: "", currentQuery: "" });
+  }
+
+  async runCdp(config, runLog) {
+    const page = await createCdpAutomationPage();
+    const { candidates: historical } = await readAllLogCandidates(this.rootDir).catch(() => ({ candidates: [] }));
+    const seen = new Set(historical.map((item) => candidateKey(item)));
+    const cities = config.cities.filter((city) => city.enabled !== false);
+    const queries = config.queries.filter(Boolean);
+    let applied = 0;
+    let screened = 0;
+    let skipped = 0;
+
+    try {
+      for (const city of cities) {
+        for (const query of queries) {
+          if (this.shouldStop(applied, config.target)) break;
+          this.updateStatus({ currentCity: city.label, currentQuery: query, message: `Searching ${city.label} / ${query}` });
+          await this.appendRun(runLog, `### Query: ${city.label}:${query}`);
+          await cdpGotoSearch(page, query, city);
+
+          for (let pageIndex = 1; pageIndex <= config.maxPagesPerQuery; pageIndex += 1) {
+            if (this.shouldStop(applied, config.target)) break;
+            const blocker = await cdpDetectPageBlocker(page);
+            if (blocker) {
+              await this.block(runLog, blocker);
+              return;
+            }
+
+            const cards = await cdpCollectCards(page);
+            this.emitLog(`Found ${cards.length} visible cards on page ${pageIndex}`);
+            if (!cards.length) {
+              const body = normalizeText(await cdpBodyText(page));
+              const noCardBlocker = detectSecurityBlocker(body);
+              if (noCardBlocker) {
+                await this.block(runLog, noCardBlocker);
+                return;
+              }
+              await this.appendRun(runLog, `- no visible cards: ${body.slice(0, 180) || "empty page"}`);
+              break;
+            }
+
+            for (const card of cards) {
+              if (this.shouldStop(applied, config.target)) break;
+              const key = candidateKey(card);
+              if (seen.has(key)) {
+                skipped += 1;
+                this.updateStatus({ skipped, screened });
+                continue;
+              }
+              seen.add(key);
+              screened += 1;
+
+              const cardScreen = screenJob(card, config);
+              if (!cardScreen.pass) {
+                skipped += 1;
+                this.emit("candidate", { ...card, screen: cardScreen, status: "skipped" });
+                await this.appendRun(runLog, `- skipped: ${formatCandidate(card)} | ${cardScreen.reason}`);
+                this.updateStatus({ screened, skipped });
+                continue;
+              }
+
+              await cdpClickCard(page, card.domIndex);
+              await delay(config.delayMs);
+              const detail = await cdpReadDetail(page);
+              const detailScreen = screenJob({ ...card, ...detail, detailText: detail.text }, config);
+              const candidate = { ...card, ...detail, screen: detailScreen };
+              this.emit("candidate", candidate);
+
+              if (!detailScreen.pass) {
+                skipped += 1;
+                await this.appendRun(runLog, `- skipped: ${formatCandidate(card)} | ${detailScreen.reason}`);
+                this.updateStatus({ screened, skipped });
+                continue;
+              }
+
+              if (config.mode === "review") {
+                await this.appendRun(runLog, `- ready: ${formatCandidate(card)} | ${detailScreen.reason}`);
+                this.emitLog(`Review ready: ${card.company} / ${card.title}`);
+                this.updateStatus({ screened, skipped, message: "Review candidate collected" });
+                continue;
+              }
+
+              const sent = await cdpClickChat(page);
+              if (sent.blocker) {
+                await this.block(runLog, sent.blocker);
+                return;
+              }
+              if (!sent.ok) {
+                skipped += 1;
+                await this.appendRun(runLog, `- skipped: ${formatCandidate(card)} | ${sent.reason || "chat button unavailable"}`);
+                this.updateStatus({ screened, skipped });
+                continue;
+              }
+              applied += 1;
+              await this.appendRun(runLog, `${applied}. ${formatCandidate(card)} | ${detailScreen.reason}`);
+              this.emit("applied", { ...candidate, appliedIndex: applied });
+              this.updateStatus({ applied, screened, skipped, message: `Applied ${applied} / ${config.target}` });
+              await delay(config.delayMs + 450);
+            }
+
+            if (this.shouldStop(applied, config.target)) break;
+            const moved = await cdpNextPage(page);
+            if (!moved) break;
+            await delay(config.delayMs + 600);
+          }
+        }
+      }
+
+      const state = applied >= config.target ? "done" : this.abortRequested ? "idle" : "done";
+      const message = applied >= config.target ? "Target reached" : this.abortRequested ? "Stopped" : "Run finished";
+      await this.appendRun(runLog, `\n- Finished: ${nowIso()}`);
+      await this.appendRun(runLog, `- Applied: ${applied} / ${config.target}`);
+      await this.appendRun(runLog, `- Screened: ${screened}`);
+      await this.appendRun(runLog, `- Skipped: ${skipped}`);
+      this.updateStatus({ state, applied, screened, skipped, message, currentCity: "", currentQuery: "" });
+    } finally {
+      page.close();
+    }
   }
 
   shouldStop(applied, target) {
@@ -909,6 +1031,191 @@ async function inspectLoginDebugPage({ navigate = false } = {}) {
   } finally {
     client.close();
   }
+}
+
+async function createCdpAutomationPage() {
+  const target = await findBestDebugPageTarget();
+  if (!target?.webSocketDebuggerUrl) {
+    throw new Error("没有找到可复用的 BOSS 浏览器页，请先点击打开登录并完成登录");
+  }
+  const client = await createCdpClient(target.webSocketDebuggerUrl);
+  await client.send("Runtime.enable").catch(() => {});
+  await client.send("Page.enable").catch(() => {});
+  return {
+    send: client.send,
+    close: client.close,
+  };
+}
+
+async function cdpEvaluate(page, fn, ...args) {
+  const expression = `(${fn.toString()})(...${JSON.stringify(args)})`;
+  const result = await page.send("Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  return result?.result?.value;
+}
+
+async function cdpGotoSearch(page, query, city) {
+  const url = `${SEARCH_BASE}?query=${encodeURIComponent(query)}&city=${encodeURIComponent(city.code || city.key || city.label)}`;
+  await page.send("Page.navigate", { url }).catch(() => {});
+  await delay(3500);
+  await cdpEvaluate(page, () => {
+    window.scrollBy(0, 320);
+    return true;
+  }).catch(() => {});
+  await delay(1200);
+}
+
+async function cdpBodyText(page) {
+  return (
+    (await cdpEvaluate(page, () => {
+      return (document.body?.innerText || "").replace(/\s+/g, " ").trim();
+    }).catch(() => "")) || ""
+  );
+}
+
+async function cdpDetectPageBlocker(page) {
+  return detectSecurityBlocker(await cdpBodyText(page));
+}
+
+async function cdpCollectCards(page) {
+  const cards =
+    (await cdpEvaluate(page, () => {
+      const selectors = ".job-card-wrap, .job-list-box li, li[class*='job-card'], [class*='job-card']";
+      const seen = new Set();
+      return [...document.querySelectorAll(selectors)]
+        .filter((el) => {
+          if (seen.has(el)) return false;
+          seen.add(el);
+          const rect = el.getBoundingClientRect();
+          const text = el.innerText || "";
+          return rect.width > 0 && rect.height > 0 && text.length > 20 && /java|后端|开发|K|薪/i.test(text);
+        })
+        .slice(0, 80)
+        .map((el, index) => {
+          const domIndex = `codex-job-${Date.now()}-${index}`;
+          el.setAttribute("data-codex-job-index", domIndex);
+          const lines = (el.innerText || "")
+            .split("\n")
+            .map((line) => line.trim())
+            .filter(Boolean);
+          const titleNode = el.querySelector(".job-name, [class*='job-name'], [class*='job-title'], a");
+          const title = (titleNode?.innerText || lines[0] || "").trim();
+          const salary = (el.querySelector(".salary, [class*='salary']")?.innerText || lines[1] || "").trim();
+          return {
+            index,
+            domIndex,
+            title,
+            salary,
+            meta: lines.slice(2, 5).join(" "),
+            company: lines[4] || lines[5] || "",
+            location: lines.slice(5, 9).join(" "),
+            visible: true,
+          };
+        });
+    }).catch(() => [])) || [];
+
+  return cards.map((card) => ({
+    ...card,
+    title: normalizeText(card.title),
+    salary: normalizeText(card.salary),
+    meta: normalizeText(card.meta),
+    company: normalizeText(card.company),
+    location: normalizeText(card.location),
+  }));
+}
+
+async function cdpClickCard(page, domIndex) {
+  await cdpEvaluate(page, (targetIndex) => {
+    const card = document.querySelector(`[data-codex-job-index="${targetIndex}"]`);
+    if (!card) return false;
+    card.scrollIntoView({ block: "center", inline: "nearest" });
+    const clickable = card.querySelector("a.job-name, [class*='job-name'], a") || card;
+    clickable.click();
+    return true;
+  }, domIndex);
+  await delay(1000);
+}
+
+async function cdpReadDetail(page) {
+  const detail =
+    (await cdpEvaluate(page, () => {
+      const box = document.querySelector(".job-detail-container") || document.querySelector(".job-detail-box") || document.body;
+      const text = box ? box.innerText || "" : document.body.innerText || "";
+      const lines = text
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const chat =
+        box.querySelector?.(".op-btn-chat") ||
+        [...document.querySelectorAll("button, a, .btn, [class*='chat']")].find((el) => /立即沟通|继续沟通|已沟通|已投递|开聊/.test(el.innerText || ""));
+      return {
+        title: lines[0] || "",
+        salary: lines[1] || "",
+        location: lines[2] || "",
+        text: text.slice(0, 6000),
+        chatText: chat ? chat.innerText || "" : "",
+      };
+    }).catch(() => ({ title: "", salary: "", location: "", text: "", chatText: "" }))) || {};
+
+  return {
+    ...detail,
+    title: normalizeText(detail.title),
+    salary: normalizeText(detail.salary),
+    location: normalizeText(detail.location),
+    text: normalizeText(detail.text),
+    chatText: normalizeText(detail.chatText),
+  };
+}
+
+async function cdpClickChat(page) {
+  const blockerBefore = await cdpDetectPageBlocker(page);
+  if (blockerBefore) return { ok: false, blocker: blockerBefore };
+  const result =
+    (await cdpEvaluate(page, () => {
+      const candidates = [
+        ...document.querySelectorAll(".job-detail-container .op-btn-chat, .job-detail-box .op-btn-chat, .op-btn-chat, button, a, .btn, [class*='chat']"),
+      ].filter((el) => {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && /立即沟通|继续沟通|已沟通|已投递|开聊/.test(el.innerText || "");
+      });
+      const button = candidates[0];
+      if (!button) return { ok: false, reason: "no chat button" };
+      const text = (button.innerText || "").trim();
+      if (/继续沟通|已沟通|已投递|已开聊/.test(text)) return { ok: false, reason: text };
+      button.scrollIntoView({ block: "center", inline: "nearest" });
+      button.click();
+      return { ok: true, text };
+    }).catch((error) => ({ ok: false, reason: error.message }))) || { ok: false, reason: "no chat button" };
+
+  if (!result.ok) return result;
+  await delay(1400);
+  const blockerAfter = await cdpDetectPageBlocker(page);
+  if (blockerAfter) return { ok: false, blocker: blockerAfter };
+  const afterText = normalizeText(await cdpBodyText(page));
+  if (/今日沟通已达上限|沟通次数已用完|打招呼次数已达上限/.test(afterText)) {
+    return { ok: false, blocker: "daily communication limit" };
+  }
+  return { ok: true };
+}
+
+async function cdpNextPage(page) {
+  const moved = await cdpEvaluate(page, () => {
+    const candidates = [...document.querySelectorAll(".options-pages a, .page a, .pagination a, a, button")].filter((el) => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && /下一页|>/.test(el.innerText || el.textContent || "");
+    });
+    const next = candidates[candidates.length - 1];
+    if (!next) return false;
+    const className = next.className || "";
+    if (/disabled|unable/.test(String(className)) || next.getAttribute("aria-disabled") === "true") return false;
+    next.click();
+    return true;
+  }).catch(() => false);
+  if (moved) await delay(2500);
+  return Boolean(moved);
 }
 
 function analyzeLoginSignals(signals = {}) {
