@@ -51,6 +51,7 @@ const tabItems = [
 const statusLabels = {
   idle: "空闲",
   preflight: "预检中",
+  checkingLogin: "检查登录",
   waitingLogin: "等待登录",
   running: "运行中",
   stopping: "停止中",
@@ -83,7 +84,7 @@ function shortNumber(value) {
 }
 
 function statusTone(state) {
-  if (state === "running" || state === "preflight" || state === "waitingLogin") return "info";
+  if (state === "running" || state === "preflight" || state === "waitingLogin" || state === "checkingLogin") return "info";
   if (state === "blocked" || state === "error") return "danger";
   if (state === "done") return "success";
   return "neutral";
@@ -126,7 +127,8 @@ function App() {
     },
   });
 
-  const isRunning = status.state === "running" || status.state === "preflight" || status.state === "stopping";
+  const isRunning = status.state === "running" || status.state === "preflight" || status.state === "stopping" || status.state === "checkingLogin";
+  const canStart = Boolean(status.loginVerified) && !isRunning && !busy;
   const enabledCities = useMemo(() => (config?.cities || []).filter((city) => city.enabled !== false), [config]);
   const candidateCities = useMemo(() => {
     const cities = new Set();
@@ -171,6 +173,19 @@ function App() {
     });
     return () => socket.close();
   }, []);
+
+  useEffect(() => {
+    if (!config || status.state !== "waitingLogin") return undefined;
+    const timer = window.setInterval(() => {
+      request("/api/browser/check-login", { method: "POST", body: JSON.stringify({ config, strict: false }) })
+        .then((payload) => {
+          if (payload.status) setStatus(payload.status);
+          if (payload.result?.ok) setNotice("登录已确认");
+        })
+        .catch(() => {});
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [config, status.state]);
 
   async function loadInitial() {
     setLoading(true);
@@ -240,7 +255,17 @@ function App() {
     await runAction("login", async () => request("/api/browser/login", { method: "POST", body: JSON.stringify({ config }) }));
   }
 
+  async function checkLogin(strict = false) {
+    await runAction("check-login", async () =>
+      request("/api/browser/check-login", { method: "POST", body: JSON.stringify({ config, strict }) }),
+    );
+  }
+
   async function startRun(mode) {
+    if (!status.loginVerified) {
+      await checkLogin(true);
+      return;
+    }
     const nextConfig = { ...config, mode };
     setConfig(nextConfig);
     autoConfirm.close();
@@ -366,11 +391,13 @@ function App() {
             busy={busy}
             liveLines={liveLines}
             isRunning={isRunning}
+            canStart={canStart}
             enabledCities={enabledCities}
             onConfig={updateConfig}
             onCity={updateCity}
             onSave={saveConfig}
             onLogin={openLogin}
+            onCheckLogin={() => checkLogin(true)}
             onStartReview={() => startRun("review")}
             onOpenAuto={autoConfirm.open}
             onStop={stopRun}
@@ -448,7 +475,7 @@ function App() {
                 <Button variant="outline" onPress={autoConfirm.close}>
                   取消
                 </Button>
-                <Button variant="danger" onPress={() => startRun("auto")} isDisabled={isRunning || busy === "start-auto"}>
+                <Button variant="danger" onPress={() => startRun("auto")} isDisabled={!canStart || busy === "start-auto"}>
                   <Send size={16} />
                   启动自动投递
                 </Button>
@@ -512,11 +539,13 @@ function RunPanel({
   busy,
   liveLines,
   isRunning,
+  canStart,
   enabledCities,
   onConfig,
   onCity,
   onSave,
   onLogin,
+  onCheckLogin,
   onStartReview,
   onOpenAuto,
   onStop,
@@ -622,11 +651,15 @@ function RunPanel({
               {busy === "login" ? <Spinner size="sm" /> : <LogIn size={16} />}
               打开登录
             </Button>
-            <Button variant="primary" onPress={onStartReview} isDisabled={isRunning || Boolean(busy)}>
+            <Button variant="outline" onPress={onCheckLogin} isDisabled={isRunning || Boolean(busy)}>
+              {busy === "check-login" ? <Spinner size="sm" /> : <RefreshCw size={16} />}
+              检查登录态
+            </Button>
+            <Button variant="primary" onPress={onStartReview} isDisabled={!canStart}>
               {busy === "start-review" ? <Spinner size="sm" /> : <Eye size={16} />}
               开始复审
             </Button>
-            <Button variant="danger-soft" onPress={onOpenAuto} isDisabled={isRunning || Boolean(busy)}>
+            <Button variant="danger-soft" onPress={onOpenAuto} isDisabled={!canStart}>
               <Send size={16} />
               自动投递
             </Button>

@@ -35,10 +35,15 @@ export class BossRunner extends EventEmitter {
     this.browser = null;
     this.context = null;
     this.page = null;
+    this.loginMonitor = null;
+    this.loginCheckInFlight = false;
+    this.loginVerified = false;
     this.abortRequested = false;
     this.status = {
       state: "idle",
       message: "Ready",
+      loginVerified: false,
+      loginCheckedAt: "",
       applied: 0,
       screened: 0,
       skipped: 0,
@@ -56,6 +61,9 @@ export class BossRunner extends EventEmitter {
   }
 
   updateStatus(patch) {
+    if (Object.prototype.hasOwnProperty.call(patch, "loginVerified")) {
+      this.loginVerified = Boolean(patch.loginVerified);
+    }
     this.status = { ...this.status, ...patch, updatedAt: nowIso() };
     this.emit("status", this.getStatus());
   }
@@ -84,15 +92,13 @@ export class BossRunner extends EventEmitter {
     if (cdpBrowser) {
       this.browser = cdpBrowser;
       this.context = cdpBrowser.contexts()[0];
-      this.page = this.context.pages().find((candidate) => !candidate.isClosed()) || (await this.context.newPage());
-      this.page.setDefaultTimeout(9000);
-      this.page.on("close", () => {
-        this.page = null;
-      });
+      this.page = selectBestPage(this.context.pages()) || (await this.context.newPage());
+      this.bindPage(this.page);
       cdpBrowser.on("disconnected", () => {
         this.browser = null;
         this.context = null;
         this.page = null;
+        this.updateStatus({ loginVerified: false });
       });
       if (initialUrl && forceNavigate) {
         await this.openLoginPage(this.page);
@@ -121,14 +127,12 @@ export class BossRunner extends EventEmitter {
       }
       throw error;
     }
-    this.page = this.context.pages()[0] || (await this.context.newPage());
-    this.page.setDefaultTimeout(9000);
-    this.page.on("close", () => {
-      this.page = null;
-    });
+    this.page = selectBestPage(this.context.pages()) || (await this.context.newPage());
+    this.bindPage(this.page);
     this.context.on("close", () => {
       this.context = null;
       this.page = null;
+      this.updateStatus({ loginVerified: false });
     });
     if (initialUrl) {
       await this.openLoginPage(this.page);
@@ -141,20 +145,29 @@ export class BossRunner extends EventEmitter {
     return chromium.connectOverCDP(LOGIN_DEBUG_URL);
   }
 
+  bindPage(page) {
+    if (!page || page.isClosed()) return;
+    page.setDefaultTimeout(9000);
+    page.on("close", () => {
+      if (this.page === page) this.page = null;
+    });
+  }
+
   async preflight(config = defaultConfig) {
     this.updateStatus({ state: "preflight", message: "正在打开 BOSS 登录页" });
     const result = await this.requireLoggedIn(config);
     if (!result.ok) return result;
-    this.updateStatus({ state: "idle", blocker: "", message: "Browser ready" });
+    this.updateStatus({ state: "idle", blocker: "", message: "登录已确认，可以开始复审或自动投递" });
     this.emitLog("Preflight passed");
     return result;
   }
 
-  async openLogin(config = defaultConfig) {
+  async openLogin(config = defaultConfig, options = {}) {
     this.abortRequested = false;
     this.updateStatus({
       state: "waitingLogin",
       message: "请在打开的 BOSS 登录页完成登录",
+      loginVerified: false,
       blocker: "",
       currentCity: "",
       currentQuery: "",
@@ -180,11 +193,15 @@ export class BossRunner extends EventEmitter {
       this.updateStatus({
         state: "waitingLogin",
         message: "请在打开的普通 Chrome 登录页完成登录；完成后再点击开始复审或自动投递",
+        loginVerified: false,
         blocker: "",
         currentCity: "",
         currentQuery: "",
       });
       this.emitLog("Login page opened; waiting for manual login");
+      if (options.startMonitor !== false) {
+        this.startLoginMonitor(config);
+      }
       return { ok: true, url: LOGIN_URL };
     } catch (error) {
       if (isProfileInUseError(error)) {
@@ -260,7 +277,8 @@ export class BossRunner extends EventEmitter {
     this.browser = null;
     this.context = null;
     this.page = null;
-    this.updateStatus({ state: "idle", message: "Browser closed" });
+    this.stopLoginMonitor();
+    this.updateStatus({ state: "idle", message: "Browser closed", loginVerified: false });
   }
 
   normalizeConfig(configInput) {
@@ -399,16 +417,58 @@ export class BossRunner extends EventEmitter {
     return detectSecurityBlocker(body);
   }
 
-  async requireLoggedIn(config) {
+  async getExistingPageForLoginCheck(config = defaultConfig) {
+    if (this.context && this.page && !this.page.isClosed()) {
+      return this.page;
+    }
+    if (!(await isLoginDebugReady())) {
+      return null;
+    }
+
+    const cdpBrowser = await this.connectToLoginChrome().catch((error) => {
+      this.emitLog(`Chrome debug connection is not ready: ${error.message}`, "warn");
+      return null;
+    });
+    if (!cdpBrowser) return null;
+    this.browser = cdpBrowser;
+    this.context = cdpBrowser.contexts()[0];
+    const page = selectBestPage(this.context.pages());
+    if (!page) return null;
+    this.page = page;
+    this.bindPage(this.page);
+    cdpBrowser.on("disconnected", () => {
+      this.browser = null;
+      this.context = null;
+      this.page = null;
+      this.updateStatus({ loginVerified: false });
+    });
+    return this.page;
+  }
+
+  async checkLogin(config = defaultConfig, options = {}) {
+    const allowNavigation = Boolean(options.allowNavigation);
+    const reopenLoginOnBlank = options.reopenLoginOnBlank !== false;
+    const announce = options.announce !== false;
     let page;
     try {
-      const hasLivePage = this.context && this.page && !this.page.isClosed();
-      const debugReady = await isLoginDebugReady();
-      if (!hasLivePage && !debugReady) {
-        await this.openLogin(config);
+      page = await this.getExistingPageForLoginCheck(config);
+      if (!page) {
+        if (reopenLoginOnBlank) {
+          await this.openLogin(config, { startMonitor: false });
+          if (!this.loginMonitor) this.startLoginMonitor(config);
+        }
+        if (announce) {
+          this.updateStatus({
+            state: "waitingLogin",
+            blocker: LOGIN_REQUIRED,
+            message: "请先在打开的 BOSS 登录页完成登录",
+            loginVerified: false,
+            currentCity: "",
+            currentQuery: "",
+          });
+        }
         return { ok: false, blocker: LOGIN_REQUIRED, url: LOGIN_URL };
       }
-      page = await this.ensureContext(config);
     } catch (error) {
       if (isProfileInUseError(error)) {
         return this.blockOnProfileInUse(error);
@@ -419,39 +479,92 @@ export class BossRunner extends EventEmitter {
     const currentPage = await this.inspectCurrentLoginState(page);
     if (!currentPage.ok) {
       const blocker = currentPage.blocker || LOGIN_REQUIRED;
-      await this.openLogin(config).catch((error) => {
-        this.emitLog(`Could not reopen login page: ${error.message}`, "warn");
-      });
-      this.updateStatus({
-        state: "waitingLogin",
-        blocker,
-        message: "请先在打开的 BOSS 登录页完成登录",
-        currentCity: "",
-        currentQuery: "",
-      });
+      if (reopenLoginOnBlank && (currentPage.blankPage || !isBossPage(page.url()))) {
+        await this.openLogin(config, { startMonitor: false }).catch((error) => {
+          this.emitLog(`Could not reopen login page: ${error.message}`, "warn");
+        });
+      }
+      if (announce) {
+        this.updateStatus({
+          state: "waitingLogin",
+          blocker,
+          message: "请先在打开的 BOSS 登录页完成登录",
+          loginVerified: false,
+          currentCity: "",
+          currentQuery: "",
+        });
+      }
+      if (!this.loginMonitor) this.startLoginMonitor(config);
       this.emitLog(`Login gate blocked: ${blocker}`, "warn");
       return { ok: false, blocker, url: page.url() };
     }
 
-    const inspected = await this.inspectLoginState(page);
+    const inspected = allowNavigation ? await this.inspectLoginState(page) : currentPage;
     if (inspected.ok) {
+      this.stopLoginMonitor();
+      this.updateStatus({
+        state: "idle",
+        blocker: "",
+        message: "登录已确认，可以开始复审或自动投递",
+        loginVerified: true,
+        loginCheckedAt: nowIso(),
+        currentCity: "",
+        currentQuery: "",
+      });
       this.emitLog("Login gate passed");
       return { ok: true, url: page.url() };
     }
 
-    await this.openLogin(config).catch((error) => {
-      this.emitLog(`Could not reopen login page: ${error.message}`, "warn");
-    });
     const blocker = inspected.blocker || LOGIN_REQUIRED;
-    this.updateStatus({
-      state: "waitingLogin",
-      blocker,
-      message: "请先在打开的 BOSS 登录页完成登录",
-      currentCity: "",
-      currentQuery: "",
-    });
+    if (announce) {
+      this.updateStatus({
+        state: "waitingLogin",
+        blocker,
+        message: "请先在打开的 BOSS 登录页完成登录",
+        loginVerified: false,
+        currentCity: "",
+        currentQuery: "",
+      });
+    }
+    if (!this.loginMonitor) this.startLoginMonitor(config);
     this.emitLog(`Login gate blocked: ${blocker}`, "warn");
     return { ok: false, blocker, url: page.url() };
+  }
+
+  async requireLoggedIn(config) {
+    return this.checkLogin(config, { allowNavigation: true, reopenLoginOnBlank: true, announce: true });
+  }
+
+  startLoginMonitor(config = defaultConfig) {
+    this.stopLoginMonitor();
+    const startedAt = Date.now();
+    this.loginMonitor = setInterval(async () => {
+      if (this.loginCheckInFlight) return;
+      if (this.status.state !== "waitingLogin") {
+        this.stopLoginMonitor();
+        return;
+      }
+      if (Date.now() - startedAt > 10 * 60 * 1000) {
+        this.stopLoginMonitor();
+        return;
+      }
+      this.loginCheckInFlight = true;
+      try {
+        await this.checkLogin(config, { allowNavigation: false, reopenLoginOnBlank: true, announce: false });
+      } catch (error) {
+        this.emitLog(`Login monitor check failed: ${error.message}`, "warn");
+      } finally {
+        this.loginCheckInFlight = false;
+      }
+    }, 2500);
+    this.loginMonitor.unref?.();
+  }
+
+  stopLoginMonitor() {
+    if (this.loginMonitor) {
+      clearInterval(this.loginMonitor);
+      this.loginMonitor = null;
+    }
   }
 
   blockOnProfileInUse(error) {
@@ -481,13 +594,13 @@ export class BossRunner extends EventEmitter {
     const blocker = detectSecurityBlocker(bodyHead);
     const loginText = /登录|注册|扫码|验证码|微信登录|手机号登录|密码登录|登录 \/ 注册|BOSS直聘 APP/.test(bodyHead);
     const loginControlsVisible = signals.loginControlCount > 0;
-    const blankPage = /^(about:blank|chrome:\/\/newtab)/i.test(page.url()) || (!bodyHead && signals.cardCount === 0 && signals.chatButtonCount === 0);
+    const blankPage = isBlankUrl(page.url()) || (!bodyHead && signals.cardCount === 0 && signals.chatButtonCount === 0);
     const looksLoggedOut = blankPage || Boolean(blocker) || page.url().includes("/web/user") || loginControlsVisible || (loginText && signals.cardCount === 0);
 
     if (looksLoggedOut) {
-      return { ok: false, blocker: blocker || LOGIN_REQUIRED, signals };
+      return { ok: false, blocker: blocker || LOGIN_REQUIRED, signals, blankPage };
     }
-    return { ok: true, signals };
+    return { ok: true, signals, blankPage };
   }
 
   async inspectLoginState(page) {
@@ -687,6 +800,17 @@ function formatCandidate(candidate) {
   return [candidate.company, candidate.title, candidate.salary, candidate.location].map((part) => normalizeText(part || "-")).join(" | ");
 }
 
+function selectBestPage(pages = []) {
+  const openPages = pages.filter((page) => page && !page.isClosed());
+  return (
+    openPages.find((page) => isBossPage(page.url()) && !page.url().includes("/web/user")) ||
+    openPages.find((page) => isBossPage(page.url())) ||
+    openPages.find((page) => !isBlankUrl(page.url())) ||
+    openPages[0] ||
+    null
+  );
+}
+
 function isBrowserClosedError(error) {
   return /Target page, context or browser has been closed|Browser has been closed|Target closed|Page closed|automation browser closed/i.test(
     String(error?.message || error || ""),
@@ -705,6 +829,10 @@ function isLoginBlocker(blocker) {
 
 function isBossPage(url) {
   return /^https?:\/\/([^/]+\.)?zhipin\.com\//i.test(String(url || ""));
+}
+
+function isBlankUrl(url) {
+  return /^(about:blank|chrome:\/\/newtab\/?|)$/i.test(String(url || ""));
 }
 
 async function readLoginSignals(page) {
@@ -731,6 +859,7 @@ async function launchLoginChrome(profileDir) {
     `--user-data-dir=${profileDir}`,
     "--no-first-run",
     "--no-default-browser-check",
+    "--new-window",
     LOGIN_URL,
   ];
   if (process.platform === "darwin") {
@@ -765,7 +894,7 @@ async function waitForLoginDebug(timeoutMs = 8000) {
 async function openUrlInLoginChrome(url) {
   const existing = await findLoginChromeTab(url).catch(() => null);
   if (existing?.id) {
-    await closeDuplicateLoginTabs(existing.id, url).catch(() => {});
+    await closeDistractingLoginTabs(existing.id, url).catch(() => {});
     await fetch(`${LOGIN_DEBUG_URL}/json/activate/${existing.id}`, { signal: AbortSignal.timeout(1500) }).catch(() => {});
     await activateChromeApp().catch(() => {});
     return waitForLoginTab(url, 4000);
@@ -781,7 +910,7 @@ async function openUrlInLoginChrome(url) {
       if (response.ok) {
         const opened = await waitForLoginTab(url, 5000);
         if (opened?.id) {
-          await closeDuplicateLoginTabs(opened.id, url).catch(() => {});
+          await closeDistractingLoginTabs(opened.id, url).catch(() => {});
           await fetch(`${LOGIN_DEBUG_URL}/json/activate/${opened.id}`, { signal: AbortSignal.timeout(1500) }).catch(() => {});
           await activateChromeApp().catch(() => {});
           return opened;
@@ -799,7 +928,7 @@ async function findLoginChromeTab(url) {
   const response = await fetch(`${LOGIN_DEBUG_URL}/json/list`, { signal: AbortSignal.timeout(1500) });
   if (!response.ok) return null;
   const tabs = await response.json();
-  return tabs.find((tab) => tab.type === "page" && tab.url === url) || tabs.find((tab) => tab.type === "page" && isBossPage(tab.url));
+  return tabs.find((tab) => tab.type === "page" && tab.url === url) || null;
 }
 
 async function waitForLoginTab(url, timeoutMs) {
@@ -812,11 +941,13 @@ async function waitForLoginTab(url, timeoutMs) {
   return null;
 }
 
-async function closeDuplicateLoginTabs(keepId, url) {
+async function closeDistractingLoginTabs(keepId, url) {
   const response = await fetch(`${LOGIN_DEBUG_URL}/json/list`, { signal: AbortSignal.timeout(1500) });
   if (!response.ok) return;
   const tabs = await response.json();
-  const duplicates = tabs.filter((tab) => tab.type === "page" && tab.id !== keepId && (tab.url === url || isBossPage(tab.url)));
+  const duplicates = tabs.filter(
+    (tab) => tab.type === "page" && tab.id !== keepId && (tab.url === url || isBossPage(tab.url) || isBlankUrl(tab.url)),
+  );
   for (const tab of duplicates) {
     await fetch(`${LOGIN_DEBUG_URL}/json/close/${tab.id}`, { signal: AbortSignal.timeout(1000) }).catch(() => {});
   }

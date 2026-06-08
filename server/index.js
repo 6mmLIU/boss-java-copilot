@@ -161,6 +161,18 @@ app.post("/api/browser/login", (req, res) =>
   }),
 );
 
+app.post("/api/browser/check-login", (req, res) =>
+  sendJson(res, async () => {
+    const config = mergeConfig(req.body?.config || (await readConfig()));
+    const result = await runner.checkLogin(config, {
+      allowNavigation: Boolean(req.body?.strict),
+      reopenLoginOnBlank: true,
+      announce: true,
+    });
+    return { ok: true, result, status: runner.getStatus() };
+  }),
+);
+
 app.post("/api/run/start", (req, res) =>
   sendJson(res, async () => {
     const base = await readConfig();
