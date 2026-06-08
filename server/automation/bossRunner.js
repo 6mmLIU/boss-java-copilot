@@ -144,7 +144,7 @@ export class BossRunner extends EventEmitter {
     this.updateStatus({ state: "preflight", message: "正在打开 BOSS 登录页" });
     const result = await this.requireLoggedIn(config);
     if (!result.ok) return result;
-    this.updateStatus({ state: "idle", blocker: "", message: "登录已确认，可以开始复审或自动投递" });
+    this.updateStatus({ state: "idle", blocker: "", message: "登录已确认，可以开始检查或自动投递" });
     this.emitLog("Preflight passed");
     return result;
   }
@@ -179,7 +179,7 @@ export class BossRunner extends EventEmitter {
       }
       this.updateStatus({
         state: "waitingLogin",
-        message: "请在打开的普通 Chrome 登录页完成登录；完成后再点击开始复审或自动投递",
+        message: "请在打开的普通 Chrome 登录页完成登录；完成后再点击开始检查或自动投递",
         loginVerified: false,
         blocker: "",
         currentCity: "",
@@ -343,7 +343,9 @@ export class BossRunner extends EventEmitter {
             const cardScreen = screenJob({ ...card, query }, config);
             if (!cardScreen.pass) {
               skipped += 1;
-              this.emit("candidate", { ...card, screen: cardScreen, status: "skipped" });
+              if (config.mode === "review") {
+                this.emit("candidate", { ...card, screen: cardScreen, status: "skipped" });
+              }
               await this.appendRun(runLog, `- skipped: ${formatCandidate(card)} | ${cardScreen.reason}`);
               this.updateStatus({ screened, skipped });
               continue;
@@ -355,7 +357,9 @@ export class BossRunner extends EventEmitter {
             const detailJob = { ...detail, ...card, query, detailText: detail.text, chatText: detail.chatText };
             const detailScreen = screenJob(detailJob, config);
             const candidate = { ...detail, ...card, screen: detailScreen, detailText: detail.text, chatText: detail.chatText };
-            this.emit("candidate", candidate);
+            if (config.mode === "review") {
+              this.emit("candidate", candidate);
+            }
 
             if (!detailScreen.pass) {
               skipped += 1;
@@ -366,8 +370,8 @@ export class BossRunner extends EventEmitter {
 
             if (config.mode === "review") {
               await this.appendRun(runLog, `- ready: ${formatCandidate(card)} | ${detailScreen.reason}`);
-              this.emitLog(`Review ready: ${card.company} / ${card.title}`);
-              this.updateStatus({ screened, skipped, message: "Review candidate collected" });
+              this.emitLog(`Check ready: ${card.company} / ${card.title}`);
+              this.updateStatus({ screened, skipped, message: "Check result collected" });
               continue;
             }
 
@@ -459,7 +463,9 @@ export class BossRunner extends EventEmitter {
               const cardScreen = screenJob({ ...card, query }, config);
               if (!cardScreen.pass) {
                 skipped += 1;
-                this.emit("candidate", { ...card, screen: cardScreen, status: "skipped" });
+                if (config.mode === "review") {
+                  this.emit("candidate", { ...card, screen: cardScreen, status: "skipped" });
+                }
                 await this.appendRun(runLog, `- skipped: ${formatCandidate(card)} | ${cardScreen.reason}`);
                 this.updateStatus({ screened, skipped });
                 continue;
@@ -471,7 +477,9 @@ export class BossRunner extends EventEmitter {
               const detailJob = { ...detail, ...card, query, detailText: detail.text, chatText: detail.chatText };
               const detailScreen = screenJob(detailJob, config);
               const candidate = { ...detail, ...card, screen: detailScreen, detailText: detail.text, chatText: detail.chatText };
-              this.emit("candidate", candidate);
+              if (config.mode === "review") {
+                this.emit("candidate", candidate);
+              }
 
               if (!detailScreen.pass) {
                 skipped += 1;
@@ -482,8 +490,8 @@ export class BossRunner extends EventEmitter {
 
               if (config.mode === "review") {
                 await this.appendRun(runLog, `- ready: ${formatCandidate(card)} | ${detailScreen.reason}`);
-                this.emitLog(`Review ready: ${card.company} / ${card.title}`);
-                this.updateStatus({ screened, skipped, message: "Review candidate collected" });
+                this.emitLog(`Check ready: ${card.company} / ${card.title}`);
+                this.updateStatus({ screened, skipped, message: "Check result collected" });
                 continue;
               }
 
@@ -619,7 +627,7 @@ export class BossRunner extends EventEmitter {
       this.updateStatus({
         state: "idle",
         blocker: "",
-        message: "登录已确认，可以开始复审或自动投递",
+        message: "登录已确认，可以开始检查或自动投递",
         loginVerified: true,
         loginCheckedAt: nowIso(),
         currentCity: "",
@@ -652,7 +660,7 @@ export class BossRunner extends EventEmitter {
       this.updateStatus({
         state: "idle",
         blocker: "",
-        message: "登录已确认，可以开始复审或自动投递",
+        message: "登录已确认，可以开始检查或自动投递",
         loginVerified: true,
         loginCheckedAt: nowIso(),
         currentCity: "",

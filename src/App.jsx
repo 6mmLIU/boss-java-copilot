@@ -44,7 +44,7 @@ const API = "";
 const tabItems = [
   { id: "run", label: "运行", icon: Play },
   { id: "filters", label: "筛选器", icon: SlidersHorizontal },
-  { id: "candidates", label: "候选池", icon: BriefcaseBusiness },
+  { id: "candidates", label: "记录", icon: BriefcaseBusiness },
   { id: "logs", label: "日志", icon: FileText },
   { id: "settings", label: "设置", icon: Settings },
 ];
@@ -168,7 +168,7 @@ function App() {
       if (packet.type === "status") setStatus(packet.payload);
       if (packet.type === "log") pushLive(`${packet.payload.level.toUpperCase()} ${packet.payload.message}`);
       if (packet.type === "runLine") pushLive(packet.payload.line);
-      if (packet.type === "candidate") pushLive(`候选: ${packet.payload.company || "-"} / ${packet.payload.title || "-"}`);
+      if (packet.type === "candidate") pushLive(`检查: ${packet.payload.company || "-"} / ${packet.payload.title || "-"}`);
       if (packet.type === "applied") pushLive(`已投递: ${packet.payload.company || "-"} / ${packet.payload.title || "-"}`);
     });
     return () => socket.close();
@@ -368,7 +368,7 @@ function App() {
       <section className="kpi-grid">
         <KpiCard title="历史已投" value={appliedTotal} icon={Send} tone="green" detail={latestLog?.file || "读取本地 Markdown 日志"} />
         <KpiCard title="本轮目标" value={config.target} icon={Gauge} tone="blue" detail={`${enabledCities.length} 个城市 / ${config.queries.length} 组关键词`} />
-        <KpiCard title="候选记录" value={candidates.length} icon={Database} tone="ink" detail={`${skippedTotal} 条跳过记录可复盘`} />
+        <KpiCard title="运行记录" value={candidates.length} icon={Database} tone="ink" detail={`${skippedTotal} 条跳过记录可复盘`} />
         <KpiCard title="运行状态" value={statusLabels[status.state] || status.state} icon={ShieldAlert} tone={statusTone(status.state)} detail={status.message || "Ready"} />
       </section>
 
@@ -464,7 +464,7 @@ function App() {
               </Modal.Header>
               <Modal.Body>
                 <p>
-                  自动模式会在筛选通过后点击“立即沟通”。如果页面出现登录、二维码、验证码、安全验证或沟通上限，runner 会停止并等待你处理。
+                  自动模式不会先堆候选；它会逐个检查岗位，符合规则就立刻点击“立即沟通”。如果页面出现登录、二维码、验证码、安全验证或沟通上限，runner 会停止并等待你处理。
                 </p>
                 <div className="confirm-metrics">
                   <span>目标 {config.target}</span>
@@ -491,7 +491,7 @@ function App() {
           <Drawer.Content placement="right">
             <Drawer.Dialog className="candidate-drawer">
               <Drawer.Header>
-                <Drawer.Heading>{selectedCandidate?.title || "候选详情"}</Drawer.Heading>
+                <Drawer.Heading>{selectedCandidate?.title || "记录详情"}</Drawer.Heading>
                 <Drawer.CloseTrigger aria-label="关闭" />
               </Drawer.Header>
               <Drawer.Body>
@@ -557,7 +557,7 @@ function RunPanel({
         <Card.Header>
           <div>
             <Card.Title>运行控制</Card.Title>
-            <Card.Description>先打开登录页，登录完成后再启动复审或自动投递。</Card.Description>
+            <Card.Description>先打开登录页。自动投递会逐个检查岗位，符合要求就立即沟通。</Card.Description>
           </div>
           <StatusPill state={status.state} />
         </Card.Header>
@@ -612,7 +612,7 @@ function RunPanel({
               onClick={() => onConfig({ mode: "review" })}
             >
               <Eye size={16} />
-              <span>复审收集</span>
+              <span>只检查</span>
             </button>
             <button
               className={cx("mode-button", config.mode === "auto" && "is-active")}
@@ -658,7 +658,7 @@ function RunPanel({
             </Button>
             <Button variant="primary" onPress={onStartReview} isDisabled={!canStart}>
               {busy === "start-review" ? <Spinner size="sm" /> : <Eye size={16} />}
-              开始复审
+              开始检查
             </Button>
             <Button variant="danger-soft" onPress={onOpenAuto} isDisabled={!canStart}>
               <Send size={16} />
@@ -797,8 +797,8 @@ function CandidatesPanel({ candidates, total, search, status, city, cities, onSe
     <Card className="table-card">
       <Card.Header>
         <div>
-          <Card.Title>候选池</Card.Title>
-          <Card.Description>来自历史投递日志和当前运行事件，最多展示前 240 条筛选结果。</Card.Description>
+          <Card.Title>投递记录</Card.Title>
+          <Card.Description>来自历史投递日志，只用于复盘已投、跳过和原因，不作为自动投递中间队列。</Card.Description>
         </div>
         <Button variant="outline" size="sm" onPress={onRefresh}>
           <RefreshCw size={15} />
@@ -826,7 +826,7 @@ function CandidatesPanel({ candidates, total, search, status, city, cities, onSe
         </div>
         <Table variant="secondary" className="candidate-table">
           <Table.ScrollContainer>
-            <Table.Content aria-label="候选岗位表">
+            <Table.Content aria-label="投递记录表">
               <Table.Header>
                 <Table.Column isRowHeader>公司</Table.Column>
                 <Table.Column>岗位</Table.Column>
@@ -836,7 +836,7 @@ function CandidatesPanel({ candidates, total, search, status, city, cities, onSe
                 <Table.Column>原因</Table.Column>
                 <Table.Column>操作</Table.Column>
               </Table.Header>
-              <Table.Body items={candidates} renderEmptyState={() => <div className="empty-state">暂无候选记录</div>}>
+              <Table.Body items={candidates} renderEmptyState={() => <div className="empty-state">暂无投递记录</div>}>
                 {(item) => (
                   <Table.Row id={item.id}>
                     <Table.Cell>{item.company}</Table.Cell>
