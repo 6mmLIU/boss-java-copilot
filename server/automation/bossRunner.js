@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { chromium } from "playwright";
+import WebSocket from "ws";
 import { defaultConfig } from "../lib/defaults.js";
 import { detectSecurityBlocker, normalizeText, readAllLogCandidates, screenJob } from "../lib/rules.js";
 
@@ -85,25 +86,13 @@ export class BossRunner extends EventEmitter {
 
     const profileDir = path.resolve(this.rootDir, config.profileDir || "data/browser-profile");
     await fs.mkdir(profileDir, { recursive: true });
-    const cdpBrowser = await this.connectToLoginChrome().catch((error) => {
-      this.emitLog(`Chrome debug connection is not ready: ${error.message}`, "warn");
-      return null;
-    });
-    if (cdpBrowser) {
-      this.browser = cdpBrowser;
-      this.context = cdpBrowser.contexts()[0];
-      this.page = selectBestPage(this.context.pages()) || (await this.context.newPage());
-      this.bindPage(this.page);
-      cdpBrowser.on("disconnected", () => {
-        this.browser = null;
-        this.context = null;
-        this.page = null;
-        this.updateStatus({ loginVerified: false });
+    if (await isLoginDebugReady()) {
+      await closeChromeForProfile(profileDir).catch((error) => {
+        this.emitLog(`Could not close login Chrome before automation: ${error.message}`, "warn");
       });
-      if (initialUrl && forceNavigate) {
-        await this.openLoginPage(this.page);
-      }
-      return this.page;
+      this.browser = null;
+      this.context = null;
+      this.page = null;
     }
 
     const launchOptions = {
@@ -410,6 +399,9 @@ export class BossRunner extends EventEmitter {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
     await page.mouse.wheel(0, 300).catch(() => {});
+    await page
+      .waitForSelector(".job-card-wrap, .job-list-box li, li[class*='job-card'], [class*='job-card'], .op-btn-chat", { timeout: 15000 })
+      .catch(() => {});
   }
 
   async detectPageBlocker(page) {
@@ -421,28 +413,7 @@ export class BossRunner extends EventEmitter {
     if (this.context && this.page && !this.page.isClosed()) {
       return this.page;
     }
-    if (!(await isLoginDebugReady())) {
-      return null;
-    }
-
-    const cdpBrowser = await this.connectToLoginChrome().catch((error) => {
-      this.emitLog(`Chrome debug connection is not ready: ${error.message}`, "warn");
-      return null;
-    });
-    if (!cdpBrowser) return null;
-    this.browser = cdpBrowser;
-    this.context = cdpBrowser.contexts()[0];
-    const page = selectBestPage(this.context.pages());
-    if (!page) return null;
-    this.page = page;
-    this.bindPage(this.page);
-    cdpBrowser.on("disconnected", () => {
-      this.browser = null;
-      this.context = null;
-      this.page = null;
-      this.updateStatus({ loginVerified: false });
-    });
-    return this.page;
+    return null;
   }
 
   async checkLogin(config = defaultConfig, options = {}) {
@@ -451,6 +422,14 @@ export class BossRunner extends EventEmitter {
     const announce = options.announce !== false;
     let page;
     try {
+      const debugSignals = await inspectLoginDebugPage({ navigate: allowNavigation }).catch((error) => {
+        this.emitLog(`Chrome debug login check failed: ${error.message}`, "warn");
+        return null;
+      });
+      if (debugSignals) {
+        return this.finishLoginCheckFromSignals(debugSignals, config, { announce });
+      }
+
       page = await this.getExistingPageForLoginCheck(config);
       if (!page) {
         if (reopenLoginOnBlank) {
@@ -531,6 +510,39 @@ export class BossRunner extends EventEmitter {
     return { ok: false, blocker, url: page.url() };
   }
 
+  finishLoginCheckFromSignals(signals, config, { announce = true } = {}) {
+    const inspected = analyzeLoginSignals(signals);
+    if (inspected.ok) {
+      this.stopLoginMonitor();
+      this.updateStatus({
+        state: "idle",
+        blocker: "",
+        message: "登录已确认，可以开始复审或自动投递",
+        loginVerified: true,
+        loginCheckedAt: nowIso(),
+        currentCity: "",
+        currentQuery: "",
+      });
+      this.emitLog("Login gate passed");
+      return { ok: true, url: signals.url };
+    }
+
+    const blocker = inspected.blocker || LOGIN_REQUIRED;
+    if (announce) {
+      this.updateStatus({
+        state: "waitingLogin",
+        blocker,
+        message: "请先在打开的 BOSS 登录页完成登录",
+        loginVerified: false,
+        currentCity: "",
+        currentQuery: "",
+      });
+    }
+    if (!this.loginMonitor) this.startLoginMonitor(config);
+    this.emitLog(`Login gate blocked: ${blocker}`, "warn");
+    return { ok: false, blocker, url: signals.url || LOGIN_URL };
+  }
+
   async requireLoggedIn(config) {
     return this.checkLogin(config, { allowNavigation: true, reopenLoginOnBlank: true, announce: true });
   }
@@ -592,7 +604,7 @@ export class BossRunner extends EventEmitter {
     const signals = await readLoginSignals(page);
     const bodyHead = normalizeText(signals.bodyHead);
     const blocker = detectSecurityBlocker(bodyHead);
-    const loginText = /登录|注册|扫码|验证码|微信登录|手机号登录|密码登录|登录 \/ 注册|BOSS直聘 APP/.test(bodyHead);
+    const loginText = /登录 \/ 注册|扫码登录|微信登录|手机号登录|密码登录|验证码登录|BOSS直聘 APP|请使用.*扫码/.test(bodyHead);
     const loginControlsVisible = signals.loginControlCount > 0;
     const blankPage = isBlankUrl(page.url()) || (!bodyHead && signals.cardCount === 0 && signals.chatButtonCount === 0);
     const looksLoggedOut = blankPage || Boolean(blocker) || page.url().includes("/web/user") || loginControlsVisible || (loginText && signals.cardCount === 0);
@@ -616,7 +628,7 @@ export class BossRunner extends EventEmitter {
 
     const bodyHead = normalizeText(signals.bodyHead);
     const blocker = detectSecurityBlocker(bodyHead);
-    const loginText = /登录|注册|扫码|验证码|微信登录|手机号登录|密码登录|登录 \/ 注册|BOSS直聘 APP/.test(bodyHead);
+    const loginText = /登录 \/ 注册|扫码登录|微信登录|手机号登录|密码登录|验证码登录|BOSS直聘 APP|请使用.*扫码/.test(bodyHead);
     const loginControlsVisible = signals.loginControlCount > 0;
     const looksLoggedOut = Boolean(blocker) || page.url().includes("/web/user") || loginControlsVisible || (loginText && signals.cardCount === 0);
 
@@ -669,24 +681,30 @@ export class BossRunner extends EventEmitter {
     }
     try {
       return await page
-        .locator(".job-card-wrap")
+        .locator(".job-card-wrap, .job-list-box li, li[class*='job-card'], [class*='job-card']")
         .evaluateAll((nodes) =>
-          nodes.map((el, index) => {
-            const lines = (el.innerText || "")
-              .split("\n")
-              .map((line) => line.trim())
-              .filter(Boolean);
-            const rect = el.getBoundingClientRect();
-            return {
-              index,
-              title: lines[0] || "",
-              salary: lines[1] || "",
-              meta: lines.slice(2, 4).join(" "),
-              company: lines[4] || "",
-              location: lines.slice(5).join(" "),
-              visible: rect.width > 0 && rect.height > 0,
-            };
-          }),
+          nodes
+            .filter((el) => {
+              const rect = el.getBoundingClientRect();
+              const text = el.innerText || "";
+              return rect.width > 0 && rect.height > 0 && text.length > 20 && /java|后端|开发|K|薪/i.test(text);
+            })
+            .map((el, index) => {
+              const lines = (el.innerText || "")
+                .split("\n")
+                .map((line) => line.trim())
+                .filter(Boolean);
+              const rect = el.getBoundingClientRect();
+              return {
+                index,
+                title: lines[0] || "",
+                salary: lines[1] || "",
+                meta: lines.slice(2, 4).join(" "),
+                company: lines[4] || "",
+                location: lines.slice(5).join(" "),
+                visible: rect.width > 0 && rect.height > 0,
+              };
+            }),
         )
         .then((cards) =>
           cards
@@ -845,12 +863,160 @@ async function readLoginSignals(page) {
       const loginControlCount = [...document.querySelectorAll("a, button, .btn, .nav-item, .login-btn, .header-login")]
         .filter((el) => {
           const rect = el.getBoundingClientRect();
-          return rect.width > 0 && rect.height > 0 && /登录|注册|扫码|验证码|微信|手机号/.test(el.innerText || "");
+          const text = el.innerText || "";
+          return rect.width > 0 && rect.height > 0 && !/分享/.test(text) && /登录|注册|验证码|手机号|扫码登录|微信登录/.test(text);
         })
         .length;
       return { bodyHead, cardCount, chatButtonCount, loginControlCount };
     })
     .catch(() => ({ bodyHead: "", cardCount: 0, chatButtonCount: 0, loginControlCount: 0 }));
+}
+
+async function inspectLoginDebugPage({ navigate = false } = {}) {
+  if (!(await isLoginDebugReady())) return null;
+  const target = await findBestDebugPageTarget();
+  if (!target?.webSocketDebuggerUrl) return null;
+  const client = await createCdpClient(target.webSocketDebuggerUrl);
+  try {
+    await client.send("Runtime.enable").catch(() => {});
+    await client.send("Page.enable").catch(() => {});
+    if (navigate) {
+      await client.send("Page.navigate", { url: LOGIN_CHECK_URL }).catch(() => {});
+      await delay(3500);
+    }
+    const result = await client.send("Runtime.evaluate", {
+      expression: `(() => {
+        const visibleText = (document.body?.innerText || "").replace(/\\s+/g, " ").trim();
+        const bodyHead = visibleText.slice(0, 4000);
+        const controls = [...document.querySelectorAll("a, button, .btn, .nav-item, .login-btn, .header-login, [class*=login]")]
+          .filter((el) => {
+            const rect = el.getBoundingClientRect();
+            const text = el.innerText || "";
+            return rect.width > 0 && rect.height > 0 && !/分享/.test(text) && /登录|注册|验证码|手机号|扫码登录|微信登录/.test(text);
+          });
+        return {
+          url: location.href,
+          title: document.title,
+          bodyHead,
+          cardCount: document.querySelectorAll(".job-card-wrap").length,
+          chatButtonCount: document.querySelectorAll(".op-btn-chat").length,
+          loginControlCount: controls.length
+        };
+      })()`,
+      returnByValue: true,
+    });
+    return result?.result?.value || null;
+  } finally {
+    client.close();
+  }
+}
+
+function analyzeLoginSignals(signals = {}) {
+  const bodyHead = normalizeText(signals.bodyHead || "");
+  const blocker = detectSecurityBlocker(bodyHead);
+  const url = String(signals.url || "");
+  const title = normalizeText(signals.title || "");
+  const loginText = /登录 \/ 注册|扫码登录|微信登录|手机号登录|密码登录|验证码登录|BOSS直聘 APP|请使用.*扫码/.test(bodyHead);
+  const loginControlsVisible = Number(signals.loginControlCount || 0) > 0;
+  const blankPage = isBlankUrl(url) && !title && !bodyHead;
+  const jobSurfaceVisible = Number(signals.cardCount || 0) > 0 || Number(signals.chatButtonCount || 0) > 0;
+  const loggedInSurface =
+    isBossPage(url) &&
+    !url.includes("/web/user") &&
+    !loginControlsVisible &&
+    !loginText &&
+    bodyHead.length > 30 &&
+    /职位|搜索|推荐|沟通|消息|简历|我的|BOSS直聘/.test(bodyHead);
+
+  if (blankPage) return { ok: false, blocker: LOGIN_REQUIRED, blankPage };
+  if (blocker) return { ok: false, blocker, blankPage };
+  if (url.includes("/web/user") || loginControlsVisible || loginText) {
+    return { ok: false, blocker: LOGIN_REQUIRED, blankPage };
+  }
+  if (jobSurfaceVisible || loggedInSurface) {
+    return { ok: true, blankPage };
+  }
+  return { ok: false, blocker: LOGIN_REQUIRED, blankPage };
+}
+
+async function findBestDebugPageTarget() {
+  const response = await fetch(`${LOGIN_DEBUG_URL}/json/list`, { signal: AbortSignal.timeout(1500) });
+  if (!response.ok) return null;
+  const targets = await response.json();
+  const pages = targets.filter((target) => target.type === "page");
+  return (
+    pages.find((target) => isBossPage(target.url) && !target.url.includes("/web/user")) ||
+    pages.find((target) => isBossPage(target.url) || /BOSS直聘/.test(String(target.title || ""))) ||
+    pages.find((target) => !isBlankUrl(target.url)) ||
+    pages[0] ||
+    null
+  );
+}
+
+function createCdpClient(webSocketUrl) {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(webSocketUrl);
+    const pending = new Map();
+    let id = 0;
+    const rejectAll = (error) => {
+      for (const entry of pending.values()) {
+        clearTimeout(entry.timer);
+        entry.reject(error);
+      }
+      pending.clear();
+    };
+
+    socket.once("open", () => {
+      resolve({
+        send(method, params = {}, timeoutMs = 6000) {
+          id += 1;
+          const messageId = id;
+          return new Promise((messageResolve, messageReject) => {
+            const timer = setTimeout(() => {
+              pending.delete(messageId);
+              messageReject(new Error(`CDP ${method} timed out`));
+            }, timeoutMs);
+            pending.set(messageId, { resolve: messageResolve, reject: messageReject, timer });
+            socket.send(JSON.stringify({ id: messageId, method, params }), (error) => {
+              if (!error) return;
+              clearTimeout(timer);
+              pending.delete(messageId);
+              messageReject(error);
+            });
+          });
+        },
+        close() {
+          socket.close();
+        },
+      });
+    });
+
+    socket.on("message", (data) => {
+      let payload;
+      try {
+        payload = JSON.parse(String(data));
+      } catch {
+        return;
+      }
+      if (!payload.id || !pending.has(payload.id)) return;
+      const entry = pending.get(payload.id);
+      pending.delete(payload.id);
+      clearTimeout(entry.timer);
+      if (payload.error) {
+        entry.reject(new Error(payload.error.message || JSON.stringify(payload.error)));
+      } else {
+        entry.resolve(payload.result || {});
+      }
+    });
+
+    socket.once("error", (error) => {
+      reject(error);
+      rejectAll(error);
+    });
+    socket.once("close", () => {
+      rejectAll(new Error("CDP socket closed"));
+    });
+  });
 }
 
 async function launchLoginChrome(profileDir) {
