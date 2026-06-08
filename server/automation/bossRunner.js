@@ -447,7 +447,7 @@ export class BossRunner extends EventEmitter {
 
   async checkLogin(config = defaultConfig, options = {}) {
     const allowNavigation = Boolean(options.allowNavigation);
-    const reopenLoginOnBlank = options.reopenLoginOnBlank !== false;
+    const reopenLoginOnBlank = Boolean(options.reopenLoginOnBlank);
     const announce = options.announce !== false;
     let page;
     try {
@@ -550,7 +550,7 @@ export class BossRunner extends EventEmitter {
       }
       this.loginCheckInFlight = true;
       try {
-        await this.checkLogin(config, { allowNavigation: false, reopenLoginOnBlank: true, announce: false });
+        await this.checkLogin(config, { allowNavigation: false, reopenLoginOnBlank: false, announce: false });
       } catch (error) {
         this.emitLog(`Login monitor check failed: ${error.message}`, "warn");
       } finally {

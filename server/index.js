@@ -166,7 +166,7 @@ app.post("/api/browser/check-login", (req, res) =>
     const config = mergeConfig(req.body?.config || (await readConfig()));
     const result = await runner.checkLogin(config, {
       allowNavigation: Boolean(req.body?.strict),
-      reopenLoginOnBlank: true,
+      reopenLoginOnBlank: Boolean(req.body?.reopen),
       announce: true,
     });
     return { ok: true, result, status: runner.getStatus() };
