@@ -11,6 +11,7 @@ import { detectSecurityBlocker, normalizeText, readAllLogCandidates, screenJob }
 const SEARCH_BASE = "https://www.zhipin.com/web/geek/jobs";
 const LOGIN_URL = "https://www.zhipin.com/web/user/?ka=header-login";
 const LOGIN_CHECK_URL = `${SEARCH_BASE}?query=Java&city=100010000`;
+const JOB_CARD_SELECTOR = ".job-card-wrap, .job-list-box li, li[class*='job-card'], [class*='job-card']";
 const LOGIN_REQUIRED = "请先在打开的 BOSS 登录页完成登录，再继续运行";
 const PROFILE_IN_USE = "浏览器配置目录已被旧自动化窗口占用";
 const LOGIN_DEBUG_PORT = Number(process.env.BOSS_CHROME_DEBUG_PORT || 9227);
@@ -538,13 +539,120 @@ export class BossRunner extends EventEmitter {
   }
 
   async gotoSearch(page, query, city) {
-    const url = `${SEARCH_BASE}?query=${encodeURIComponent(query)}&city=${encodeURIComponent(city.code || city.key || city.label)}`;
+    const url = buildSearchUrl(query, city);
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
+    await this.waitForSearchSurface(page);
+
+    let state = await this.readSearchState(page);
+    if (!isSearchReadyState(state)) {
+      this.emitLog(`Search URL did not land on results; trying page search from ${state.url || "unknown URL"}`, "warn");
+      const submitted = await this.submitSearchFromCurrentPage(page, query);
+      if (submitted) {
+        await this.waitForSearchSurface(page);
+        state = await this.readSearchState(page);
+      }
+    }
+
+    if (!isSearchReadyState(state)) {
+      throw new Error(formatSearchNavigationError(state, query, city));
+    }
+
     await page.mouse.wheel(0, 300).catch(() => {});
+    return state;
+  }
+
+  async waitForSearchSurface(page) {
     await page
-      .waitForSelector(".job-card-wrap, .job-list-box li, li[class*='job-card'], [class*='job-card'], .op-btn-chat", { timeout: 15000 })
+      .waitForFunction(
+        (selector) => {
+          const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
+          return (
+            location.href.includes("/web/geek/jobs") ||
+            document.querySelector(selector) ||
+            /安全验证|验证码|登录 \/ 注册|请先登录|暂无|没有找到|搜索|职位/.test(text)
+          );
+        },
+        JOB_CARD_SELECTOR,
+        { timeout: 15000 },
+      )
       .catch(() => {});
+  }
+
+  async readSearchState(page) {
+    return page
+      .evaluate((selector) => {
+        const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
+        const inputs = [...document.querySelectorAll("input, textarea")].filter((el) => {
+          const rect = el.getBoundingClientRect();
+          const hint = [el.placeholder, el.getAttribute("aria-label"), el.value].filter(Boolean).join(" ");
+          return rect.width > 0 && rect.height > 0 && /搜索|职位|公司|Java/i.test(hint);
+        });
+        const buttons = [...document.querySelectorAll("button, a, .btn, [role='button']")].filter((el) => {
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && /搜索/.test(el.innerText || el.textContent || "");
+        });
+        return {
+          url: location.href,
+          title: document.title || "",
+          bodyHead: text.slice(0, 500),
+          bodyLength: text.length,
+          cardCount: document.querySelectorAll(selector).length,
+          chatButtonCount: document.querySelectorAll(".op-btn-chat").length,
+          searchInputCount: inputs.length,
+          searchButtonCount: buttons.length,
+        };
+      }, JOB_CARD_SELECTOR)
+      .catch(() => ({
+        url: page.url(),
+        title: "",
+        bodyHead: "",
+        bodyLength: 0,
+        cardCount: 0,
+        chatButtonCount: 0,
+        searchInputCount: 0,
+        searchButtonCount: 0,
+      }));
+  }
+
+  async submitSearchFromCurrentPage(page, query) {
+    const input = page
+      .locator(
+        [
+          "input[placeholder*='搜索职位']",
+          "input[placeholder*='职位']",
+          "input[placeholder*='搜索']",
+          "textarea[placeholder*='搜索']",
+          ".search-box input",
+          ".search-input input",
+          "input",
+        ].join(", "),
+      )
+      .first();
+    if (!(await input.count().catch(() => 0))) return false;
+
+    await input.scrollIntoViewIfNeeded().catch(() => {});
+    await input.click({ timeout: 5000 }).catch(() => {});
+    await input.fill(query, { timeout: 5000 }).catch(async () => {
+      await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => {});
+      await page.keyboard.type(query, { delay: 5 }).catch(() => {});
+    });
+
+    const searchButton = page
+      .locator("button, a, .btn, [role='button']")
+      .filter({ hasText: /^搜索$/ })
+      .first();
+    if (await searchButton.count().catch(() => 0)) {
+      await Promise.all([
+        page.waitForLoadState("domcontentloaded", { timeout: 12000 }).catch(() => {}),
+        searchButton.click({ timeout: 5000 }).catch(() => {}),
+      ]);
+    } else {
+      await page.keyboard.press("Enter").catch(() => {});
+    }
+    await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
+    await delay(1200);
+    return true;
   }
 
   async detectPageBlocker(page) {
@@ -824,7 +932,7 @@ export class BossRunner extends EventEmitter {
     }
     try {
       return await page
-        .locator(".job-card-wrap, .job-list-box li, li[class*='job-card'], [class*='job-card']")
+        .locator(JOB_CARD_SELECTOR)
         .evaluateAll((nodes) =>
           nodes
             .filter((el) => {
@@ -961,6 +1069,23 @@ function formatCandidate(candidate) {
   return [candidate.company, candidate.title, candidate.salary, candidate.location].map((part) => normalizeText(part || "-")).join(" | ");
 }
 
+function buildSearchUrl(query, city) {
+  return `${SEARCH_BASE}?query=${encodeURIComponent(query)}&city=${encodeURIComponent(city.code || city.key || city.label)}`;
+}
+
+function isSearchReadyState(state = {}) {
+  if (!isJobSearchPage(state.url)) return false;
+  if (Number(state.bodyLength || 0) < 40 && Number(state.cardCount || 0) === 0 && Number(state.chatButtonCount || 0) === 0) return false;
+  return true;
+}
+
+function formatSearchNavigationError(state = {}, query = "", city = {}) {
+  const cityLabel = city.label || city.key || "";
+  const body = normalizeText(state.bodyHead || "");
+  const detail = body ? `；页面内容: ${body.slice(0, 120)}` : "";
+  return `BOSS 搜索结果页没有打开，已停止以避免反复刷新。查询: ${cityLabel}:${query}；当前 URL: ${state.url || "unknown"}${detail}`;
+}
+
 function selectBestPage(pages = []) {
   const openPages = pages.filter((page) => page && !page.isClosed());
   return (
@@ -1075,9 +1200,7 @@ async function inspectLoginDebugPage({ navigate = false } = {}) {
 
 async function createCdpAutomationPage() {
   const target = await findBestDebugPageTarget();
-  if (!target?.webSocketDebuggerUrl) {
-    throw new Error("没有找到可复用的 BOSS 浏览器页，请先点击打开登录并完成登录");
-  }
+  if (!target?.webSocketDebuggerUrl) return openDebugUrl(LOGIN_CHECK_URL);
   return connectCdpTarget(target);
 }
 
@@ -1138,31 +1261,37 @@ async function cdpEvaluate(page, fn, ...args) {
 
 async function waitForSearchDom(page) {
   for (let attempt = 0; attempt < 30; attempt += 1) {
-    const ready = await cdpEvaluate(page, () => {
+    const ready = await cdpEvaluate(page, (selector) => {
       const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
       return {
+        url: location.href,
         state: document.readyState,
         textLength: text.length,
         text: text.slice(0, 160),
-        cardCount: document.querySelectorAll(".job-card-wrap, .job-list-box li, li[class*='job-card'], [class*='job-card']").length,
+        cardCount: document.querySelectorAll(selector).length,
       };
-    }).catch(() => ({ state: "", textLength: 0, text: "", cardCount: 0 }));
+    }, JOB_CARD_SELECTOR).catch(() => ({ url: "", state: "", textLength: 0, text: "", cardCount: 0 }));
     const loadingOnly = ready.textLength < 40 && /loading|加载中|请稍候/i.test(String(ready.text || ""));
     if (ready.cardCount > 0) return ready;
-    if (!loadingOnly && ready.textLength > 120 && /职位|暂无|没有找到|登录|安全验证|验证码/.test(String(ready.text || ""))) return ready;
+    if (isJobSearchPage(ready.url) && !loadingOnly && ready.textLength > 40) return ready;
+    if (!loadingOnly && ready.textLength > 120 && /暂无|没有找到|登录|安全验证|验证码/.test(String(ready.text || ""))) return ready;
     await delay(500);
   }
   return { state: "", textLength: 0, text: "", cardCount: 0 };
 }
 
 async function cdpGotoSearch(page, query, city) {
-  const url = `${SEARCH_BASE}?query=${encodeURIComponent(query)}&city=${encodeURIComponent(city.code || city.key || city.label)}`;
+  const url = buildSearchUrl(query, city);
   const currentUrl = await cdpEvaluate(page, () => location.href).catch(() => "");
   let activePage = page;
 
   if (!isJobSearchPage(currentUrl)) {
-    activePage = await openDebugUrl(url);
-    page.close();
+    await activePage.send("Page.navigate", { url }).catch(() => {});
+    await delay(5000);
+    const currentTarget = await waitForDebugTarget((target) => target.id === activePage.targetId, 5000);
+    if (!currentTarget?.webSocketDebuggerUrl) {
+      activePage = await openDebugUrl(url);
+    }
   } else if (isSameSearchUrl(currentUrl, url)) {
     await waitForSearchDom(activePage);
   } else {
@@ -1177,12 +1306,88 @@ async function cdpGotoSearch(page, query, city) {
   }
 
   await waitForSearchDom(activePage);
+  let state = await cdpReadSearchState(activePage);
+  if (!isSearchReadyState(state)) {
+    await cdpSubmitSearchFromCurrentPage(activePage, query);
+    await waitForSearchDom(activePage);
+    state = await cdpReadSearchState(activePage);
+  }
+  if (!isSearchReadyState(state)) {
+    throw new Error(formatSearchNavigationError(state, query, city));
+  }
   await cdpEvaluate(activePage, () => {
     window.scrollBy(0, 320);
     return true;
   }).catch(() => {});
   await delay(1200);
   return activePage;
+}
+
+async function cdpReadSearchState(page) {
+  return (
+    (await cdpEvaluate(page, (selector) => {
+      const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
+      const inputs = [...document.querySelectorAll("input, textarea")].filter((el) => {
+        const rect = el.getBoundingClientRect();
+        const hint = [el.placeholder, el.getAttribute("aria-label"), el.value].filter(Boolean).join(" ");
+        return rect.width > 0 && rect.height > 0 && /搜索|职位|公司|Java/i.test(hint);
+      });
+      const buttons = [...document.querySelectorAll("button, a, .btn, [role='button']")].filter((el) => {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && /搜索/.test(el.innerText || el.textContent || "");
+      });
+      return {
+        url: location.href,
+        title: document.title || "",
+        bodyHead: text.slice(0, 500),
+        bodyLength: text.length,
+        cardCount: document.querySelectorAll(selector).length,
+        chatButtonCount: document.querySelectorAll(".op-btn-chat").length,
+        searchInputCount: inputs.length,
+        searchButtonCount: buttons.length,
+      };
+    }, JOB_CARD_SELECTOR).catch(() => null)) || {
+      url: "",
+      title: "",
+      bodyHead: "",
+      bodyLength: 0,
+      cardCount: 0,
+      chatButtonCount: 0,
+      searchInputCount: 0,
+      searchButtonCount: 0,
+    }
+  );
+}
+
+async function cdpSubmitSearchFromCurrentPage(page, query) {
+  const submitted = await cdpEvaluate(page, (value) => {
+    const inputs = [...document.querySelectorAll("input, textarea")].filter((el) => {
+      const rect = el.getBoundingClientRect();
+      const hint = [el.placeholder, el.getAttribute("aria-label"), el.value].filter(Boolean).join(" ");
+      return rect.width > 0 && rect.height > 0 && /搜索|职位|公司|Java/i.test(hint);
+    });
+    const input = inputs[0];
+    if (!input) return false;
+    input.scrollIntoView({ block: "center", inline: "nearest" });
+    input.focus();
+    input.value = value;
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, data: value, inputType: "insertText" }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    const exactButtons = [...document.querySelectorAll("button, a, .btn, [role='button']")].filter((el) => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && /^搜索$/.test((el.innerText || el.textContent || "").trim());
+    });
+    const button = exactButtons[0];
+    if (button) {
+      button.click();
+      return true;
+    }
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true }));
+    return true;
+  }, query).catch(() => false);
+  if (submitted) await delay(1800);
+  return Boolean(submitted);
 }
 
 async function cdpBodyText(page) {
@@ -1199,9 +1404,9 @@ async function cdpDetectPageBlocker(page) {
 
 async function cdpCollectCards(page) {
   const cards =
-    (await cdpEvaluate(page, () => {
+    (await cdpEvaluate(page, (selector) => {
       const primary = [...document.querySelectorAll(".job-card-wrap")];
-      const fallback = [...document.querySelectorAll(".job-list-box li, li[class*='job-card'], [class*='job-card']")].filter(
+      const fallback = [...document.querySelectorAll(selector)].filter(
         (el) => !el.closest(".job-card-wrap"),
       );
       const nodes = primary.length ? primary : fallback;
@@ -1236,7 +1441,7 @@ async function cdpCollectCards(page) {
             visible: true,
           };
         });
-    }).catch(() => [])) || [];
+    }, JOB_CARD_SELECTOR).catch(() => [])) || [];
 
   return cards.map((card) => ({
     ...card,
@@ -1518,7 +1723,8 @@ async function openUrlInLoginChrome(url) {
         signal: AbortSignal.timeout(2500),
       });
       if (response.ok) {
-        const opened = await waitForLoginTab(url, 5000);
+        const openedPayload = await response.json().catch(() => null);
+        const opened = (await waitForLoginTab(url, 5000)) || openedPayload;
         if (opened?.id) {
           await closeDistractingLoginTabs(opened.id, url).catch(() => {});
           await fetch(`${LOGIN_DEBUG_URL}/json/activate/${opened.id}`, { signal: AbortSignal.timeout(1500) }).catch(() => {});
