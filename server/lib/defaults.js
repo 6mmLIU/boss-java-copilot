@@ -71,7 +71,7 @@ export const defaultConfig = {
   browserChannel: "chrome",
   profileDir: "data/browser-profile",
   headless: false,
-  delayMs: 900,
+  delayMs: 1200,
   maxPagesPerQuery: 2,
   qualityMode: "better",
   minSalaryK: 12,

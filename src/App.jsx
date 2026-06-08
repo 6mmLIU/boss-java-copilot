@@ -175,17 +175,18 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!config || status.state !== "waitingLogin") return undefined;
+    if (!config || status.state !== "waitingLogin" || status.loginVerified || busy) return undefined;
     const timer = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
       request("/api/browser/check-login", { method: "POST", body: JSON.stringify({ config, strict: false }) })
         .then((payload) => {
           if (payload.status) setStatus(payload.status);
           if (payload.result?.ok) setNotice("登录已确认");
         })
         .catch(() => {});
-    }, 2500);
+    }, 10000);
     return () => window.clearInterval(timer);
-  }, [config, status.state]);
+  }, [busy, config, status.loginVerified, status.state]);
 
   async function loadInitial() {
     setLoading(true);
@@ -263,7 +264,7 @@ function App() {
 
   async function startRun(mode) {
     if (!status.loginVerified) {
-      await checkLogin(true);
+      setError("请先点击“打开登录”，扫码完成后再点击“检查登录态”。登录确认后才能开始投递。");
       return;
     }
     const nextConfig = { ...config, mode };
@@ -397,7 +398,7 @@ function App() {
             onCity={updateCity}
             onSave={saveConfig}
             onLogin={openLogin}
-            onCheckLogin={() => checkLogin(true)}
+            onCheckLogin={() => checkLogin(false)}
             onStartReview={() => startRun("review")}
             onOpenAuto={autoConfirm.open}
             onStop={stopRun}
@@ -595,8 +596,8 @@ function RunPanel({
             <Field label="动作间隔 ms">
               <Input
                 type="number"
-                min="250"
-                step="50"
+                min="1200"
+                step="100"
                 value={String(config.delayMs)}
                 onChange={(event) => onConfig({ delayMs: Number(event.target.value) })}
                 fullWidth

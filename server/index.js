@@ -59,7 +59,7 @@ async function writeConfig(config) {
 }
 
 function mergeConfig(config = {}) {
-  return {
+  const merged = {
     ...defaultConfig,
     ...config,
     cities: Array.isArray(config.cities) ? config.cities : defaultConfig.cities,
@@ -69,6 +69,13 @@ function mergeConfig(config = {}) {
     preferredTech: Array.isArray(config.preferredTech) ? config.preferredTech : defaultConfig.preferredTech,
     preferredDomains: Array.isArray(config.preferredDomains) ? config.preferredDomains : defaultConfig.preferredDomains,
     allowedExperience: Array.isArray(config.allowedExperience) ? config.allowedExperience : defaultConfig.allowedExperience,
+  };
+  return {
+    ...merged,
+    target: Math.max(1, Number(merged.target || defaultConfig.target)),
+    delayMs: Math.max(1200, Number(merged.delayMs || defaultConfig.delayMs)),
+    maxPagesPerQuery: Math.max(1, Number(merged.maxPagesPerQuery || defaultConfig.maxPagesPerQuery)),
+    minSalaryK: Math.max(1, Number(merged.minSalaryK || defaultConfig.minSalaryK)),
   };
 }
 

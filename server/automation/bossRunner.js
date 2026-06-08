@@ -40,6 +40,7 @@ export class BossRunner extends EventEmitter {
     this.loginCheckInFlight = false;
     this.loginVerified = false;
     this.abortRequested = false;
+    this.activeRun = false;
     this.status = {
       state: "idle",
       message: "Ready",
@@ -87,12 +88,9 @@ export class BossRunner extends EventEmitter {
     const profileDir = path.resolve(this.rootDir, config.profileDir || "data/browser-profile");
     await fs.mkdir(profileDir, { recursive: true });
     if (await isLoginDebugReady()) {
-      await closeChromeForProfile(profileDir).catch((error) => {
-        this.emitLog(`Could not close login Chrome before automation: ${error.message}`, "warn");
-      });
-      this.browser = null;
-      this.context = null;
-      this.page = null;
+      const wrapped = new Error("已有 BOSS 登录窗口正在运行，请复用当前窗口，不要重新启动未登录窗口");
+      wrapped.code = "BROWSER_PROFILE_IN_USE";
+      throw wrapped;
     }
 
     const launchOptions = {
@@ -201,7 +199,7 @@ export class BossRunner extends EventEmitter {
   }
 
   async start(configInput = {}) {
-    if (this.status.state === "running") {
+    if (this.activeRun || this.status.state === "running") {
       return this.getStatus();
     }
     const config = this.normalizeConfig(configInput);
@@ -237,21 +235,34 @@ export class BossRunner extends EventEmitter {
       logFile: path.relative(this.rootDir, runLog),
       startedAt: nowIso(),
     });
-    this.run(config, runLog).catch((error) => {
-      const browserClosed = isBrowserClosedError(error);
-      this.updateStatus({
-        state: browserClosed ? "blocked" : "error",
-        message: browserClosed ? "Automation browser was closed" : error.message,
-        blocker: browserClosed ? "automation browser closed; run preflight again" : error.message,
+    this.activeRun = true;
+    this.run(config, runLog)
+      .catch((error) => {
+        const browserClosed = isBrowserClosedError(error);
+        this.updateStatus({
+          state: browserClosed ? "blocked" : "error",
+          message: browserClosed ? "Automation browser was closed" : error.message,
+          blocker: browserClosed ? "automation browser closed; run preflight again" : error.message,
+        });
+        this.emitLog(error.stack || error.message, "error");
+      })
+      .finally(() => {
+        this.activeRun = false;
+        if (this.status.state === "stopping") {
+          this.updateStatus({ state: "idle", message: "Stopped", currentCity: "", currentQuery: "" });
+        }
       });
-      this.emitLog(error.stack || error.message, "error");
-    });
     return this.getStatus();
   }
 
   async stop(reason = "stopped by user") {
     this.abortRequested = true;
-    this.updateStatus({ state: "stopping", message: reason });
+    this.updateStatus({
+      state: this.activeRun ? "stopping" : "idle",
+      message: reason,
+      currentCity: "",
+      currentQuery: "",
+    });
     this.emitLog(reason, "warn");
     return this.getStatus();
   }
@@ -280,7 +291,7 @@ export class BossRunner extends EventEmitter {
     return {
       ...merged,
       target: Math.max(1, Number(merged.target || 30)),
-      delayMs: Math.max(250, Number(merged.delayMs || 900)),
+      delayMs: Math.max(1200, Number(merged.delayMs || 1200)),
       maxPagesPerQuery: Math.max(1, Number(merged.maxPagesPerQuery || 2)),
     };
   }
@@ -329,7 +340,7 @@ export class BossRunner extends EventEmitter {
             seen.add(key);
             screened += 1;
 
-            const cardScreen = screenJob(card, config);
+            const cardScreen = screenJob({ ...card, query }, config);
             if (!cardScreen.pass) {
               skipped += 1;
               this.emit("candidate", { ...card, screen: cardScreen, status: "skipped" });
@@ -341,8 +352,9 @@ export class BossRunner extends EventEmitter {
             await this.clickCard(page, card.index);
             await delay(config.delayMs);
             const detail = await this.readDetail(page);
-            const detailScreen = screenJob({ ...card, ...detail, detailText: detail.text }, config);
-            const candidate = { ...card, ...detail, screen: detailScreen };
+            const detailJob = { ...detail, ...card, query, detailText: detail.text, chatText: detail.chatText };
+            const detailScreen = screenJob(detailJob, config);
+            const candidate = { ...detail, ...card, screen: detailScreen, detailText: detail.text, chatText: detail.chatText };
             this.emit("candidate", candidate);
 
             if (!detailScreen.pass) {
@@ -371,7 +383,7 @@ export class BossRunner extends EventEmitter {
               continue;
             }
             applied += 1;
-            await this.appendRun(runLog, `${applied}. ${formatCandidate(card)} | ${detailScreen.reason}`);
+            await this.appendRun(runLog, `${applied}. ${formatCandidate(card)} | ${detailScreen.reason} | 点击: ${sent.text || "立即沟通"}`);
             this.emit("applied", { ...candidate, appliedIndex: applied });
             this.updateStatus({ applied, screened, skipped, message: `Applied ${applied} / ${config.target}` });
             await delay(config.delayMs + 450);
@@ -395,7 +407,7 @@ export class BossRunner extends EventEmitter {
   }
 
   async runCdp(config, runLog) {
-    const page = await createCdpAutomationPage();
+    let page = await createCdpAutomationPage();
     const { candidates: historical } = await readAllLogCandidates(this.rootDir).catch(() => ({ candidates: [] }));
     const seen = new Set(historical.map((item) => candidateKey(item)));
     const cities = config.cities.filter((city) => city.enabled !== false);
@@ -410,7 +422,7 @@ export class BossRunner extends EventEmitter {
           if (this.shouldStop(applied, config.target)) break;
           this.updateStatus({ currentCity: city.label, currentQuery: query, message: `Searching ${city.label} / ${query}` });
           await this.appendRun(runLog, `### Query: ${city.label}:${query}`);
-          await cdpGotoSearch(page, query, city);
+          page = await cdpGotoSearch(page, query, city);
 
           for (let pageIndex = 1; pageIndex <= config.maxPagesPerQuery; pageIndex += 1) {
             if (this.shouldStop(applied, config.target)) break;
@@ -444,7 +456,7 @@ export class BossRunner extends EventEmitter {
               seen.add(key);
               screened += 1;
 
-              const cardScreen = screenJob(card, config);
+              const cardScreen = screenJob({ ...card, query }, config);
               if (!cardScreen.pass) {
                 skipped += 1;
                 this.emit("candidate", { ...card, screen: cardScreen, status: "skipped" });
@@ -456,8 +468,9 @@ export class BossRunner extends EventEmitter {
               await cdpClickCard(page, card.domIndex);
               await delay(config.delayMs);
               const detail = await cdpReadDetail(page);
-              const detailScreen = screenJob({ ...card, ...detail, detailText: detail.text }, config);
-              const candidate = { ...card, ...detail, screen: detailScreen };
+              const detailJob = { ...detail, ...card, query, detailText: detail.text, chatText: detail.chatText };
+              const detailScreen = screenJob(detailJob, config);
+              const candidate = { ...detail, ...card, screen: detailScreen, detailText: detail.text, chatText: detail.chatText };
               this.emit("candidate", candidate);
 
               if (!detailScreen.pass) {
@@ -486,7 +499,7 @@ export class BossRunner extends EventEmitter {
                 continue;
               }
               applied += 1;
-              await this.appendRun(runLog, `${applied}. ${formatCandidate(card)} | ${detailScreen.reason}`);
+              await this.appendRun(runLog, `${applied}. ${formatCandidate(card)} | ${detailScreen.reason} | 点击: ${sent.text || "立即沟通"}`);
               this.emit("applied", { ...candidate, appliedIndex: applied });
               this.updateStatus({ applied, screened, skipped, message: `Applied ${applied} / ${config.target}` });
               await delay(config.delayMs + 450);
@@ -666,7 +679,7 @@ export class BossRunner extends EventEmitter {
   }
 
   async requireLoggedIn(config) {
-    return this.checkLogin(config, { allowNavigation: true, reopenLoginOnBlank: true, announce: true });
+    return this.checkLogin(config, { allowNavigation: false, reopenLoginOnBlank: false, announce: true });
   }
 
   startLoginMonitor(config = defaultConfig) {
@@ -690,7 +703,7 @@ export class BossRunner extends EventEmitter {
       } finally {
         this.loginCheckInFlight = false;
       }
-    }, 2500);
+    }, 10000);
     this.loginMonitor.unref?.();
   }
 
@@ -901,7 +914,7 @@ export class BossRunner extends EventEmitter {
     if (/今日沟通已达上限|沟通次数已用完|打招呼次数已达上限/.test(afterText)) {
       return { ok: false, blocker: "daily communication limit" };
     }
-    return { ok: true };
+    return { ok: true, text: text || "立即沟通" };
   }
 
   async nextPage(page) {
@@ -971,6 +984,20 @@ function isBossPage(url) {
   return /^https?:\/\/([^/]+\.)?zhipin\.com\//i.test(String(url || ""));
 }
 
+function isJobSearchPage(url) {
+  return isBossPage(url) && String(url || "").includes("/web/geek/jobs");
+}
+
+function isSameSearchUrl(left, right) {
+  try {
+    const a = new URL(left);
+    const b = new URL(right);
+    return a.pathname === b.pathname && a.searchParams.get("query") === b.searchParams.get("query") && a.searchParams.get("city") === b.searchParams.get("city");
+  } catch {
+    return left === right;
+  }
+}
+
 function isBlankUrl(url) {
   return /^(about:blank|chrome:\/\/newtab\/?|)$/i.test(String(url || ""));
 }
@@ -985,8 +1012,13 @@ async function readLoginSignals(page) {
       const loginControlCount = [...document.querySelectorAll("a, button, .btn, .nav-item, .login-btn, .header-login")]
         .filter((el) => {
           const rect = el.getBoundingClientRect();
-          const text = el.innerText || "";
-          return rect.width > 0 && rect.height > 0 && !/分享/.test(text) && /登录|注册|验证码|手机号|扫码登录|微信登录/.test(text);
+          const text = (el.innerText || "").replace(/\s+/g, " ").trim();
+          return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            !/分享|招聘|职位|注册工程师|注册会计|药品注册/.test(text) &&
+            /登录|验证码|手机号登录|扫码登录|微信登录|登录 \/ 注册/.test(text)
+          );
         })
         .length;
       return { bodyHead, cardCount, chatButtonCount, loginControlCount };
@@ -1013,8 +1045,8 @@ async function inspectLoginDebugPage({ navigate = false } = {}) {
         const controls = [...document.querySelectorAll("a, button, .btn, .nav-item, .login-btn, .header-login, [class*=login]")]
           .filter((el) => {
             const rect = el.getBoundingClientRect();
-            const text = el.innerText || "";
-            return rect.width > 0 && rect.height > 0 && !/分享/.test(text) && /登录|注册|验证码|手机号|扫码登录|微信登录/.test(text);
+            const text = (el.innerText || "").replace(/\\s+/g, " ").trim();
+            return rect.width > 0 && rect.height > 0 && !/分享|招聘|职位|注册工程师|注册会计|药品注册/.test(text) && /登录|验证码|手机号登录|扫码登录|微信登录|登录 \\/ 注册/.test(text);
           });
         return {
           url: location.href,
@@ -1038,13 +1070,52 @@ async function createCdpAutomationPage() {
   if (!target?.webSocketDebuggerUrl) {
     throw new Error("没有找到可复用的 BOSS 浏览器页，请先点击打开登录并完成登录");
   }
+  return connectCdpTarget(target);
+}
+
+async function connectCdpTarget(target) {
   const client = await createCdpClient(target.webSocketDebuggerUrl);
   await client.send("Runtime.enable").catch(() => {});
   await client.send("Page.enable").catch(() => {});
   return {
+    targetId: target.id,
     send: client.send,
     close: client.close,
   };
+}
+
+async function listDebugPageTargets() {
+  const response = await fetch(`${LOGIN_DEBUG_URL}/json/list`, { signal: AbortSignal.timeout(1500) });
+  if (!response.ok) return [];
+  const targets = await response.json();
+  return targets.filter((target) => target.type === "page");
+}
+
+async function waitForDebugTarget(predicate, timeoutMs = 8000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const target = (await listDebugPageTargets().catch(() => [])).find(predicate);
+    if (target?.webSocketDebuggerUrl) return target;
+    await delay(300);
+  }
+  return null;
+}
+
+async function openDebugUrl(url) {
+  const encoded = encodeURIComponent(url);
+  const response = await fetch(`${LOGIN_DEBUG_URL}/json/new?${encoded}`, {
+    method: "PUT",
+    signal: AbortSignal.timeout(3000),
+  });
+  if (!response.ok) throw new Error(`无法打开 BOSS 搜索页: ${response.status}`);
+  const opened = await response.json().catch(() => null);
+  const target =
+    (await waitForDebugTarget((candidate) => candidate.id === opened?.id || candidate.url === url || isJobSearchPage(candidate.url), 10000)) ||
+    opened;
+  if (!target?.webSocketDebuggerUrl) throw new Error("BOSS 搜索页没有保持打开");
+  await fetch(`${LOGIN_DEBUG_URL}/json/activate/${target.id}`, { signal: AbortSignal.timeout(1500) }).catch(() => {});
+  await activateChromeApp().catch(() => {});
+  return connectCdpTarget(target);
 }
 
 async function cdpEvaluate(page, fn, ...args) {
@@ -1057,15 +1128,53 @@ async function cdpEvaluate(page, fn, ...args) {
   return result?.result?.value;
 }
 
+async function waitForSearchDom(page) {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const ready = await cdpEvaluate(page, () => {
+      const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
+      return {
+        state: document.readyState,
+        textLength: text.length,
+        text: text.slice(0, 160),
+        cardCount: document.querySelectorAll(".job-card-wrap, .job-list-box li, li[class*='job-card'], [class*='job-card']").length,
+      };
+    }).catch(() => ({ state: "", textLength: 0, text: "", cardCount: 0 }));
+    const loadingOnly = ready.textLength < 40 && /loading|加载中|请稍候/i.test(String(ready.text || ""));
+    if (ready.cardCount > 0) return ready;
+    if (!loadingOnly && ready.textLength > 120 && /职位|暂无|没有找到|登录|安全验证|验证码/.test(String(ready.text || ""))) return ready;
+    await delay(500);
+  }
+  return { state: "", textLength: 0, text: "", cardCount: 0 };
+}
+
 async function cdpGotoSearch(page, query, city) {
   const url = `${SEARCH_BASE}?query=${encodeURIComponent(query)}&city=${encodeURIComponent(city.code || city.key || city.label)}`;
-  await page.send("Page.navigate", { url }).catch(() => {});
-  await delay(3500);
-  await cdpEvaluate(page, () => {
+  const currentUrl = await cdpEvaluate(page, () => location.href).catch(() => "");
+  let activePage = page;
+
+  if (!isJobSearchPage(currentUrl)) {
+    activePage = await openDebugUrl(url);
+    page.close();
+  } else if (isSameSearchUrl(currentUrl, url)) {
+    await waitForSearchDom(activePage);
+  } else {
+    await activePage.send("Page.navigate", { url }).catch(() => {});
+    await delay(5000);
+    const currentTarget = await waitForDebugTarget((target) => target.id === activePage.targetId, 5000);
+    if (!currentTarget?.webSocketDebuggerUrl) {
+      const fallbackTarget = await waitForDebugTarget((target) => isJobSearchPage(target.url), 3000);
+      activePage.close();
+      activePage = fallbackTarget?.webSocketDebuggerUrl ? await connectCdpTarget(fallbackTarget) : await openDebugUrl(url);
+    }
+  }
+
+  await waitForSearchDom(activePage);
+  await cdpEvaluate(activePage, () => {
     window.scrollBy(0, 320);
     return true;
   }).catch(() => {});
   await delay(1200);
+  return activePage;
 }
 
 async function cdpBodyText(page) {
@@ -1083,9 +1192,13 @@ async function cdpDetectPageBlocker(page) {
 async function cdpCollectCards(page) {
   const cards =
     (await cdpEvaluate(page, () => {
-      const selectors = ".job-card-wrap, .job-list-box li, li[class*='job-card'], [class*='job-card']";
+      const primary = [...document.querySelectorAll(".job-card-wrap")];
+      const fallback = [...document.querySelectorAll(".job-list-box li, li[class*='job-card'], [class*='job-card']")].filter(
+        (el) => !el.closest(".job-card-wrap"),
+      );
+      const nodes = primary.length ? primary : fallback;
       const seen = new Set();
-      return [...document.querySelectorAll(selectors)]
+      return nodes
         .filter((el) => {
           if (seen.has(el)) return false;
           seen.add(el);
@@ -1173,22 +1286,27 @@ async function cdpReadDetail(page) {
 async function cdpClickChat(page) {
   const blockerBefore = await cdpDetectPageBlocker(page);
   if (blockerBefore) return { ok: false, blocker: blockerBefore };
-  const result =
-    (await cdpEvaluate(page, () => {
-      const candidates = [
-        ...document.querySelectorAll(".job-detail-container .op-btn-chat, .job-detail-box .op-btn-chat, .op-btn-chat, button, a, .btn, [class*='chat']"),
-      ].filter((el) => {
-        const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0 && /立即沟通|继续沟通|已沟通|已投递|开聊/.test(el.innerText || "");
-      });
-      const button = candidates[0];
-      if (!button) return { ok: false, reason: "no chat button" };
-      const text = (button.innerText || "").trim();
-      if (/继续沟通|已沟通|已投递|已开聊/.test(text)) return { ok: false, reason: text };
-      button.scrollIntoView({ block: "center", inline: "nearest" });
-      button.click();
-      return { ok: true, text };
-    }).catch((error) => ({ ok: false, reason: error.message }))) || { ok: false, reason: "no chat button" };
+  let result = { ok: false, reason: "no chat button" };
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    result =
+      (await cdpEvaluate(page, () => {
+        const candidates = [
+          ...document.querySelectorAll(".job-detail-container .op-btn-chat, .job-detail-box .op-btn-chat, .op-btn-chat, button, a, .btn, [class*='chat']"),
+        ].filter((el) => {
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && /立即沟通|继续沟通|已沟通|已投递|开聊/.test(el.innerText || "");
+        });
+        const button = candidates[0];
+        if (!button) return { ok: false, reason: "no chat button" };
+        const text = (button.innerText || "").trim();
+        if (/继续沟通|已沟通|已投递|已开聊/.test(text)) return { ok: false, reason: text };
+        button.scrollIntoView({ block: "center", inline: "nearest" });
+        button.click();
+        return { ok: true, text };
+      }).catch((error) => ({ ok: false, reason: error.message }))) || { ok: false, reason: "no chat button" };
+    if (result.ok || result.reason !== "no chat button") break;
+    await delay(500);
+  }
 
   if (!result.ok) return result;
   await delay(1400);
@@ -1198,7 +1316,17 @@ async function cdpClickChat(page) {
   if (/今日沟通已达上限|沟通次数已用完|打招呼次数已达上限/.test(afterText)) {
     return { ok: false, blocker: "daily communication limit" };
   }
-  return { ok: true };
+  const afterButton =
+    (await cdpEvaluate(page, () => {
+      const button = [...document.querySelectorAll(".job-detail-container .op-btn-chat, .job-detail-box .op-btn-chat, .op-btn-chat, button, a, .btn, [class*='chat']")]
+        .filter((el) => {
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && /立即沟通|继续沟通|已沟通|已投递|已开聊|开聊/.test(el.innerText || "");
+        })
+        .at(0);
+      return (button?.innerText || "").trim();
+    }).catch(() => "")) || "";
+  return { ok: true, text: result.text || afterButton || "立即沟通", afterText: normalizeText(afterButton) };
 }
 
 async function cdpNextPage(page) {
@@ -1252,6 +1380,7 @@ async function findBestDebugPageTarget() {
   const targets = await response.json();
   const pages = targets.filter((target) => target.type === "page");
   return (
+    pages.find((target) => isJobSearchPage(target.url)) ||
     pages.find((target) => isBossPage(target.url) && !target.url.includes("/web/user")) ||
     pages.find((target) => isBossPage(target.url) || /BOSS直聘/.test(String(target.title || ""))) ||
     pages.find((target) => !isBlankUrl(target.url)) ||
@@ -1365,7 +1494,7 @@ async function waitForLoginDebug(timeoutMs = 8000) {
 }
 
 async function openUrlInLoginChrome(url) {
-  const existing = await findLoginChromeTab(url).catch(() => null);
+  const existing = (await findLoginChromeTab(url).catch(() => null)) || (await waitForLoginTab(url, 3000).catch(() => null));
   if (existing?.id) {
     await closeDistractingLoginTabs(existing.id, url).catch(() => {});
     await fetch(`${LOGIN_DEBUG_URL}/json/activate/${existing.id}`, { signal: AbortSignal.timeout(1500) }).catch(() => {});
@@ -1394,6 +1523,22 @@ async function openUrlInLoginChrome(url) {
     }
     await delay(500);
   }
+  const reusable = await findReusableBlankTab().catch(() => null);
+  if (reusable?.webSocketDebuggerUrl) {
+    const client = await createCdpClient(reusable.webSocketDebuggerUrl);
+    try {
+      await client.send("Page.enable").catch(() => {});
+      await client.send("Page.navigate", { url }).catch(() => {});
+      const opened = await waitForLoginTab(url, 6000);
+      if (opened?.id) {
+        await fetch(`${LOGIN_DEBUG_URL}/json/activate/${opened.id}`, { signal: AbortSignal.timeout(1500) }).catch(() => {});
+        await activateChromeApp().catch(() => {});
+        return opened;
+      }
+    } finally {
+      client.close();
+    }
+  }
   return null;
 }
 
@@ -1401,7 +1546,12 @@ async function findLoginChromeTab(url) {
   const response = await fetch(`${LOGIN_DEBUG_URL}/json/list`, { signal: AbortSignal.timeout(1500) });
   if (!response.ok) return null;
   const tabs = await response.json();
-  return tabs.find((tab) => tab.type === "page" && tab.url === url) || null;
+  return (
+    tabs.find((tab) => tab.type === "page" && tab.url === url) ||
+    tabs.find((tab) => tab.type === "page" && isBossPage(tab.url) && /登录|用户|user|BOSS直聘/i.test(String(tab.title || tab.url || ""))) ||
+    tabs.find((tab) => tab.type === "page" && isBossPage(tab.url)) ||
+    null
+  );
 }
 
 async function waitForLoginTab(url, timeoutMs) {
@@ -1419,11 +1569,18 @@ async function closeDistractingLoginTabs(keepId, url) {
   if (!response.ok) return;
   const tabs = await response.json();
   const duplicates = tabs.filter(
-    (tab) => tab.type === "page" && tab.id !== keepId && (tab.url === url || isBossPage(tab.url) || isBlankUrl(tab.url)),
+    (tab) => tab.type === "page" && tab.id !== keepId && (tab.url === url || isBlankUrl(tab.url)),
   );
   for (const tab of duplicates) {
     await fetch(`${LOGIN_DEBUG_URL}/json/close/${tab.id}`, { signal: AbortSignal.timeout(1000) }).catch(() => {});
   }
+}
+
+async function findReusableBlankTab() {
+  const response = await fetch(`${LOGIN_DEBUG_URL}/json/list`, { signal: AbortSignal.timeout(1500) });
+  if (!response.ok) return null;
+  const tabs = await response.json();
+  return tabs.find((tab) => tab.type === "page" && isBlankUrl(tab.url)) || null;
 }
 
 async function closeChromeForProfile(profileDir) {

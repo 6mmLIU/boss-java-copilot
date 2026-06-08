@@ -114,8 +114,8 @@ export function parseSalary(text = "") {
 
 function detectExperience(text = "") {
   const source = normalizeText(text);
-  if (/10年以上|十年以上|10年/.test(source)) return "10年以上";
   if (/5\s*-\s*10年|5-10年|五年以上|5年以上|6年以上|7年以上|8年以上/.test(source)) return "5-10年";
+  if (/10年以上|十年以上|(^|[^-\d])10年/.test(source)) return "10年以上";
   if (/3\s*-\s*5年|3-5年/.test(source)) return "3-5年";
   if (/1\s*-\s*3年|1-3年|2年以上|三年以下/.test(source)) return "1-3年";
   if (/1年以内|一年以内/.test(source)) return "1年以内";
@@ -143,7 +143,7 @@ function scoreCompany(text, salaryMin, config) {
   return { pass: false, score: 0, reason: "公司/业务质量未达优先模式" };
 }
 
-function blockReason(text, title, config) {
+function blockReason(text, title, config, summaryText = text) {
   if (hasAny(text, config.hardExclusions)) return "硬性排除词";
   if (/\bOD\b|OD岗位|外包OD/i.test(text)) return "OD/外包岗位";
   if (/(\d+\s*个月|半年|短期|项目制)/i.test(text)) return "短期/项目制";
@@ -164,7 +164,7 @@ function blockReason(text, title, config) {
   if (/测试工程师|运维工程师|实施工程师|项目经理|销售|客服/.test(text) && !/java|后端|服务端/i.test(text)) {
     return "非研发岗位";
   }
-  if (hasAny(text, config.outsourcingSignals)) return "外包/驻场信号";
+  if (hasAny(summaryText, config.outsourcingSignals)) return "外包/驻场信号";
   if (/精通.*架构|架构设计经验|架构师/.test(text)) return "偏架构/专家岗";
   return "";
 }
@@ -193,9 +193,11 @@ export function screenJob(job = {}, configInput = defaultConfig) {
   const meta = normalizeText(job.meta || job.tags || "");
   const detail = normalizeText(job.detailText || job.text || job.description || "");
   const chatText = normalizeText(job.chatText || "");
-  const text = normalizeText([title, company, salaryRaw, location, meta, detail].filter(Boolean).join(" "));
+  const query = normalizeText(job.query || "");
+  const summaryText = normalizeText([title, company, salaryRaw, location, meta].filter(Boolean).join(" "));
+  const text = normalizeText([summaryText, detail].filter(Boolean).join(" "));
   const salary = parseSalary(salaryRaw || text);
-  const hardBlock = blockReason(text, title, config);
+  const hardBlock = blockReason(text, title, config, summaryText);
   const security = detectSecurityBlocker([text, chatText].join(" "));
   const experience = detectExperience(text);
   const techHits = findHits(text, config.preferredTech, 6);
@@ -236,11 +238,15 @@ export function screenJob(job = {}, configInput = defaultConfig) {
       warnings,
     };
   }
-  if (!/java|后端|服务端|软件开发|开发工程师/i.test(text)) {
+  const titleLooksBackend = /java|后端|后台|服务端|软件开发|开发工程师/i.test(title || text);
+  const queryMatchesJavaBackend = /java/i.test(query) && /后端|后台|服务端|开发工程师/i.test(title || text);
+  const explicitJavaStack = /Java|Spring|SpringBoot|Spring Cloud|SpringCloud|MyBatis|JVM|Dubbo|Nacos|Feign/i.test(text);
+  if (!titleLooksBackend && !queryMatchesJavaBackend) {
     return { pass: false, shouldApply: false, score: 0, status: "skipped", reason: "不是 Java/后端主方向", reasons: ["不是 Java/后端主方向"], warnings };
   }
-  if (detail && !/Java|Spring|SpringBoot|Spring Cloud|SpringCloud|MyBatis|JVM|Dubbo|Nacos|Feign/i.test(text)) {
-    return { pass: false, shouldApply: false, score: 0, status: "skipped", reason: "Java 技术栈不够明确", reasons: ["Java 技术栈不够明确"], warnings };
+  if (detail && !explicitJavaStack && !/java/i.test(title) && !queryMatchesJavaBackend) {
+    warnings.push("Java 技术栈不够明确");
+    score -= 8;
   }
   if (/一周前活跃|半个月|月前活跃|几个月|长期未活跃/.test(text)) {
     warnings.push("HR 活跃度偏低");
@@ -258,29 +264,24 @@ export function screenJob(job = {}, configInput = defaultConfig) {
   const quality = scoreCompany(text, salary.min || 0, config);
   score += quality.score;
   if (config.qualityMode === "better" && !quality.pass) {
-    return {
-      pass: false,
-      shouldApply: false,
-      score: Math.max(0, Math.min(100, score)),
-      status: "skipped",
-      reason: quality.reason,
-      reasons: [quality.reason],
-      warnings,
-    };
+    warnings.push(quality.reason);
+    score -= 8;
   }
 
   if (active) reasons.push(active);
+  if (queryMatchesJavaBackend) reasons.push(`搜索: ${query}`);
   if (quality.reason) reasons.push(quality.reason);
   if (domainHits.length) reasons.push(`业务: ${domainHits.slice(0, 3).join("/")}`);
   if (techHits.length) reasons.push(`技术: ${techHits.slice(0, 4).join("/")}`);
   if (experience) reasons.push(`经验: ${experience}`);
 
   const boundedScore = Math.max(0, Math.min(100, Math.round(score)));
+  const threshold = config.qualityMode === "better" ? 55 : 50;
   return {
-    pass: boundedScore >= 60,
-    shouldApply: boundedScore >= 60,
+    pass: boundedScore >= threshold,
+    shouldApply: boundedScore >= threshold,
     score: boundedScore,
-    status: boundedScore >= 60 ? "ready" : "review",
+    status: boundedScore >= threshold ? "ready" : "review",
     reason: reasons.join(" / ") || "Java 后端匹配",
     reasons,
     warnings,
